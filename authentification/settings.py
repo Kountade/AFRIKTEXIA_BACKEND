@@ -26,7 +26,11 @@ SECRET_KEY = "django-insecure-9ftnoe#sy3po^#^06+-!--y4_8ek%ki_zc)tr35f2luccblvz4
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+
+ALLOWED_HOSTS = ["afriktexia-backend.onrender.com",
+                 "localhost", "127.0.0.1"]
+CSRF_TRUSTED_ORIGINS = ['https://afriktexia-backend.onrender.com']
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 
 # Application definition
@@ -59,8 +63,12 @@ MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
 ]
 
+CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173"
+    "http://192.168.0.161:3000",
+    "https://afriktexia-backend.onrender.com",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
 ]
 AUTH_USER_MODEL = 'users.CustomUser'
 
