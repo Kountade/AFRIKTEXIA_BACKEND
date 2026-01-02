@@ -154,20 +154,20 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 
-STATIC_ROOT = BASE_DIR / "staticfiles"
+STATIC_URL = '/static/'
+STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static')]  # Dossier pour les fichiers statiques en développement
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')  # Dossier pour collectstatic
+
+# Configuration WhiteNoise
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
+# Configuration des fichiers média
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media/')
 
-# Configuration pour les images
+# Configuration pour les images (optionnel)
 IMAGE_MAX_SIZE = (800, 800)  # Taille max des images
 THUMBNAIL_SIZE = (150, 150)  # Taille des miniatures
-
-# Pour gérer les fichiers statiques en production
-STATIC_URL = '/static/'
-STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
-STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static')]
 
 
 # Default primary key field type
