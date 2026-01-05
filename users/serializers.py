@@ -825,6 +825,8 @@ class TransfertEntrepotCreateSerializer(serializers.ModelSerializer):
 
 
 # Serializer pour récupérer les stocks disponibles par produit
+
+
 class StockDisponibleSerializer(serializers.Serializer):
     produit_id = serializers.IntegerField()
 

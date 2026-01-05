@@ -275,7 +275,8 @@ class MouvementStockViewSet(viewsets.ModelViewSet):
 # Nouvelles vues pour les entrepôts
 class EntrepotViewSet(viewsets.ModelViewSet):
     serializer_class = EntrepotSerializer
-    permission_classes = [IsAdminOrVendeur]  # MODIFIÉ: Changé à IsAdminOrVendeur
+    # MODIFIÉ: Changé à IsAdminOrVendeur
+    permission_classes = [IsAdminOrVendeur]
 
     def get_queryset(self):
         # LES VENDEURS VOIENT TOUS LES ENTREPÔTS ACTIFS
@@ -396,8 +397,12 @@ class StockDisponibleViewSet(viewsets.ViewSet):
 
 
 # views.py - TransfertEntrepotViewSet
+
+# views.py - TransfertEntrepotViewSet
+
+
 class TransfertEntrepotViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAdmin]  # Seuls les admins peuvent faire des transferts
+    permission_classes = [permissions.IsAuthenticated]
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -415,7 +420,7 @@ class TransfertEntrepotViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        serializer.save()
 
     @action(detail=True, methods=['post'])
     def confirmer(self, request, pk=None):
@@ -494,6 +499,7 @@ class TransfertEntrepotViewSet(viewsets.ModelViewSet):
                 {"detail": "Transfert non trouvé."},
                 status=status.HTTP_404_NOT_FOUND
             )
+# views.py - Modifiez VenteViewSet et ajoutez ces vues
 
 
 class VenteViewSet(viewsets.ModelViewSet):
@@ -899,7 +905,8 @@ class DashboardViewSet(viewsets.ViewSet):
                 created_by=user, statut='confirmee'
             )
             clients_filter = Client.objects.all()  # Vendeur voit tous les clients
-            entrepots_filter = Entrepot.objects.filter(actif=True)  # Vendeur voit tous les entrepôts actifs
+            # Vendeur voit tous les entrepôts actifs
+            entrepots_filter = Entrepot.objects.filter(actif=True)
 
         # Statistiques générales
         total_ventes = ventes_filter.count()
@@ -1285,7 +1292,7 @@ class RapportsViewSet(viewsets.ViewSet):
     def entrepots(self, request):
         """Rapport sur les entrepôts"""
         user = request.user
-        
+
         # Les vendeurs voient tous les entrepôts actifs
         if user.role == 'admin':
             entrepots = Entrepot.objects.all()
