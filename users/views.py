@@ -773,12 +773,12 @@ class HistoriqueClientViewSet(viewsets.ViewSet):
         client_id = request.query_params.get('client_id')
 
         if not client_id:
-            return Response({'error': 'client_id est requis'}, status=400)
+            return Response({'error': 'client_id est requis'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             client = Client.objects.get(id=client_id)
         except Client.DoesNotExist:
-            return Response({'error': 'Client non trouvé'}, status=404)
+            return Response({'error': 'Client non trouvé'}, status=status.HTTP_404_NOT_FOUND)
 
         # Récupérer toutes les ventes du client
         ventes = Vente.objects.filter(
@@ -796,28 +796,23 @@ class HistoriqueClientViewSet(viewsets.ViewSet):
             statut_paiement__in=['non_paye', 'partiel']
         ).count()
 
-        dernier_achat = ventes.first().created_at if ventes.exists() else None
+        # CORRECTION : Gérer le cas où il n'y a pas de ventes
+        dernier_achat = None
+        if ventes.exists():
+            premiere_vente = ventes.first()
+            if premiere_vente:
+                dernier_achat = premiere_vente.created_at
 
-        # Pagination
-        page = self.paginate_queryset(ventes)
-        if page is not None:
-            ventes_serializer = VenteDetailSerializer(page, many=True)
+        # Appliquer la pagination manuelle si nécessaire
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
 
-            return self.get_paginated_response({
-                'client': ClientSerializer(client).data,
-                'statistiques': {
-                    'total_achats': total_achats,
-                    'total_paye': total_paye,
-                    'solde_restant': total_achats - total_paye,
-                    'nombre_ventes': ventes.count(),
-                    'ventes_en_retard': ventes_en_retard,
-                    'dernier_achat': dernier_achat
-                },
-                'ventes': ventes_serializer.data
-            })
+        start_index = (page - 1) * page_size
+        end_index = start_index + page_size
 
-        # Si pas de pagination
-        ventes_serializer = VenteDetailSerializer(ventes, many=True)
+        ventes_paginees = ventes[start_index:end_index]
+
+        ventes_serializer = VenteDetailSerializer(ventes_paginees, many=True)
 
         return Response({
             'client': ClientSerializer(client).data,
@@ -829,7 +824,11 @@ class HistoriqueClientViewSet(viewsets.ViewSet):
                 'ventes_en_retard': ventes_en_retard,
                 'dernier_achat': dernier_achat
             },
-            'ventes': ventes_serializer.data
+            'ventes': ventes_serializer.data,
+            'count': ventes.count(),
+            'page': page,
+            'page_size': page_size,
+            'total_pages': (ventes.count() + page_size - 1) // page_size
         })
 
 
