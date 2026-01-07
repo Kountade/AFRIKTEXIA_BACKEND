@@ -217,10 +217,8 @@ class StockEntrepot(models.Model):
     entrepot = models.ForeignKey(Entrepot, on_delete=models.CASCADE)
     produit = models.ForeignKey(Produit, on_delete=models.CASCADE)
     quantite = models.IntegerField(default=0)
-    quantite_reservee = models.IntegerField(
-        default=0)  # Pour les ventes en cours
+    quantite_reservee = models.IntegerField(default=0)
     stock_alerte = models.IntegerField(default=5)
-    # Rayon, étagère, etc.
     emplacement = models.CharField(max_length=100, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -233,14 +231,6 @@ class StockEntrepot(models.Model):
     def quantite_disponible(self):
         """Quantité réellement disponible pour vente"""
         return max(0, self.quantite - self.quantite_reservee)
-
-    @property
-    def en_rupture(self):
-        return self.quantite_disponible <= 0
-
-    @property
-    def stock_faible(self):
-        return 0 < self.quantite_disponible <= self.stock_alerte
 
     def reserver_stock(self, quantite):
         """Réserver du stock pour une vente"""
@@ -258,20 +248,46 @@ class StockEntrepot(models.Model):
 
     def prelever_stock(self, quantite):
         """Prélever du stock (confirmer une vente)"""
-        if quantite > self.quantite_reservee:
-            raise ValueError(
-                f"Quantité réservée insuffisante: {self.quantite_reservee}")
+        # CORRECTION ICI : Logique de prélèvement améliorée
 
+        if quantite <= 0:
+            raise ValueError("Quantité doit être positive")
+
+        # Vérifier si on a assez de stock total
         if quantite > self.quantite:
             raise ValueError(f"Stock total insuffisant: {self.quantite}")
 
-        self.quantite_reservee -= quantite
-        self.quantite -= quantite
+        # Calculer combien on peut prendre du stock disponible
+        stock_disponible = self.quantite - self.quantite_reservee
+
+        if stock_disponible >= quantite:
+            # Cas 1: On a assez de stock disponible, on prélève directement
+            self.quantite -= quantite
+        else:
+            # Cas 2: On n'a pas assez de stock disponible, on doit utiliser une partie des réserves
+            stock_disponible_a_prelever = max(0, stock_disponible)
+            quantite_restante = quantite - stock_disponible_a_prelever
+
+            # Vérifier si on a assez de réserves
+            if quantite_restante > self.quantite_reservee:
+                raise ValueError(
+                    f"Stock réservé insuffisant: {self.quantite_reservee} "
+                    f"(besoin de {quantite_restante})"
+                )
+
+            # Prélèvement en deux étapes :
+            # 1. D'abord le stock disponible
+            if stock_disponible_a_prelever > 0:
+                self.quantite -= stock_disponible_a_prelever
+
+            # 2. Puis le stock réservé
+            self.quantite -= quantite_restante
+            self.quantite_reservee -= quantite_restante
+
         self.save()
 
     def __str__(self):
         return f"{self.produit.nom} - {self.entrepot.nom}: {self.quantite_disponible}"
-
 # MAINTENANT MouvementStock peut référencer Entrepot
 
 
