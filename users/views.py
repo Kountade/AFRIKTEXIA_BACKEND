@@ -769,6 +769,41 @@ class VenteViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+    @action(detail=False, methods=['get'])
+    def ventes_impayees(self, request):
+        """Liste des ventes impayées ou partiellement payées"""
+        queryset = self.get_queryset().filter(
+            statut='confirmee',
+            statut_paiement__in=['non_paye', 'partiel']
+        ).order_by('date_echeance')
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = VenteDetailSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = VenteDetailSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def ventes_en_retard(self, request):
+        """Liste des ventes en retard de paiement"""
+        queryset = self.get_queryset().filter(
+            statut='confirmee',
+            statut_paiement__in=['non_paye', 'partiel', 'retard'],
+            date_echeance__lt=timezone.now().date()
+        ).order_by('date_echeance')
+
+        # Calculer les jours de retard pour chaque vente
+        result = []
+        for vente in queryset:
+            data = VenteDetailSerializer(vente).data
+            data['jours_retard'] = vente.jours_retard(
+            ) if hasattr(vente, 'jours_retard') else 0
+            result.append(data)
+
+        return Response(result)
+
 
 class HistoriqueClientViewSet(viewsets.ViewSet):
     permission_classes = [IsAdminOrVendeur]
