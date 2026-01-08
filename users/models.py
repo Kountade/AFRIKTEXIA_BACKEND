@@ -9,8 +9,7 @@ from django.template.loader import render_to_string
 from django.core.mail import EmailMultiAlternatives
 from django.utils.html import strip_tags
 from django.utils import timezone
-
-# Ajoutez ces imports si nécessaire
+from django.db import transaction
 from django.db.models import Q
 
 
@@ -63,7 +62,6 @@ class Categorie(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-
         ordering = ['-created_at']
 
     def nombre_produits(self):
@@ -87,17 +85,13 @@ class Fournisseur(models.Model):
         return self.nom
 
 
-# ... autres imports ...
-
-
 class Produit(models.Model):
     code = models.CharField(max_length=50, unique=True)
     nom = models.CharField(max_length=200)
     description = models.TextField(blank=True)
     categorie = models.ForeignKey(
         Categorie, on_delete=models.SET_NULL, null=True)
-    prix_achat = models.DecimalField(
-        max_digits=10, decimal_places=2)  # CORRIGÉ ICI
+    prix_achat = models.DecimalField(max_digits=10, decimal_places=2)
     prix_vente = models.DecimalField(max_digits=10, decimal_places=2)
     stock_alerte = models.IntegerField(default=5)
     fournisseur = models.ForeignKey(
@@ -112,7 +106,7 @@ class Produit(models.Model):
         upload_to='produits/thumbnails/',
         null=True,
         blank=True,
-        editable=False  # Généré automatiquement
+        editable=False
     )
     created_by = models.ForeignKey(
         CustomUser, on_delete=models.SET_NULL, null=True)
@@ -135,7 +129,6 @@ class Produit(models.Model):
         )['total'] or 0
         return total
 
-    # PROPRIÉTÉS (ajoutez @property)
     @property
     def stock_disponible(self):
         """Stock disponible pour vente"""
@@ -175,11 +168,8 @@ class Client(models.Model):
     def __str__(self):
         return self.nom
 
-# DÉPLACEZ Entrepot ICI, AVANT MouvementStock
-
 
 class Entrepot(models.Model):
-    """Modèle pour les entrepôts"""
     nom = models.CharField(max_length=200)
     adresse = models.TextField()
     telephone = models.CharField(max_length=20, blank=True)
@@ -197,7 +187,6 @@ class Entrepot(models.Model):
         verbose_name_plural = 'Entrepôts'
 
     def stock_total_valeur(self):
-        """Calcule la valeur totale du stock dans l'entrepôt"""
         stocks = StockEntrepot.objects.filter(entrepot=self)
         total = 0
         for stock in stocks:
@@ -205,7 +194,6 @@ class Entrepot(models.Model):
         return total
 
     def produits_count(self):
-        """Nombre de produits différents dans l'entrepôt"""
         return StockEntrepot.objects.filter(entrepot=self).count()
 
     def __str__(self):
@@ -213,7 +201,6 @@ class Entrepot(models.Model):
 
 
 class StockEntrepot(models.Model):
-    """Stock d'un produit dans un entrepôt spécifique"""
     entrepot = models.ForeignKey(Entrepot, on_delete=models.CASCADE)
     produit = models.ForeignKey(Produit, on_delete=models.CASCADE)
     quantite = models.IntegerField(default=0)
@@ -230,65 +217,74 @@ class StockEntrepot(models.Model):
     @property
     def quantite_disponible(self):
         """Quantité réellement disponible pour vente"""
-        return max(0, self.quantite - self.quantite_reservee)
+        disponible = self.quantite - self.quantite_reservee
+        return max(0, disponible)
+
+    @property
+    def en_rupture(self):
+        return self.quantite_disponible <= 0
+
+    @property
+    def stock_faible(self):
+        return 0 < self.quantite_disponible <= self.stock_alerte
 
     def reserver_stock(self, quantite):
         """Réserver du stock pour une vente"""
-        if quantite > self.quantite_disponible:
-            raise ValueError(
-                f"Stock insuffisant. Disponible: {self.quantite_disponible}")
-
-        self.quantite_reservee += quantite
-        self.save()
-
-    def liberer_stock(self, quantite):
-        """Libérer du stock réservé"""
-        self.quantite_reservee = max(0, self.quantite_reservee - quantite)
-        self.save()
-
-    def prelever_stock(self, quantite):
-        """Prélever du stock (confirmer une vente)"""
-        # CORRECTION ICI : Logique de prélèvement améliorée
-
         if quantite <= 0:
             raise ValueError("Quantité doit être positive")
 
-        # Vérifier si on a assez de stock total
-        if quantite > self.quantite:
-            raise ValueError(f"Stock total insuffisant: {self.quantite}")
+        disponible = self.quantite_disponible
+        if quantite > disponible:
+            raise ValueError(
+                f"Stock disponible insuffisant dans cet entrepôt: {disponible} unités disponibles"
+            )
 
-        # Calculer combien on peut prendre du stock disponible
-        stock_disponible = self.quantite - self.quantite_reservee
+        with transaction.atomic():
+            # Utiliser F() pour éviter les problèmes de concurrence
+            StockEntrepot.objects.filter(id=self.id).update(
+                quantite_reservee=models.F('quantite_reservee') + quantite,
+                updated_at=timezone.now()
+            )
+            self.refresh_from_db()
 
-        if stock_disponible >= quantite:
-            # Cas 1: On a assez de stock disponible, on prélève directement
-            self.quantite -= quantite
-        else:
-            # Cas 2: On n'a pas assez de stock disponible, on doit utiliser une partie des réserves
-            stock_disponible_a_prelever = max(0, stock_disponible)
-            quantite_restante = quantite - stock_disponible_a_prelever
+    def liberer_stock(self, quantite):
+        """Libérer du stock réservé"""
+        if quantite <= 0:
+            raise ValueError("Quantité doit être positive")
 
-            # Vérifier si on a assez de réserves
-            if quantite_restante > self.quantite_reservee:
+        with transaction.atomic():
+            # S'assurer qu'on ne libère pas plus que ce qui est réservé
+            StockEntrepot.objects.filter(id=self.id).update(
+                quantite_reservee=models.F('quantite_reservee') - quantite,
+                updated_at=timezone.now()
+            )
+            self.refresh_from_db()
+
+    def prelever_stock(self, quantite):
+        """Prélever du stock (confirmer une vente)"""
+        if quantite <= 0:
+            raise ValueError("Quantité doit être positive")
+
+        with transaction.atomic():
+            # Recharger l'objet avec verrouillage
+            stock = StockEntrepot.objects.select_for_update().get(id=self.id)
+
+            # Vérifier qu'on a assez de stock réservé
+            if quantite > stock.quantite_reservee:
                 raise ValueError(
-                    f"Stock réservé insuffisant: {self.quantite_reservee} "
-                    f"(besoin de {quantite_restante})"
+                    f"Quantité à prélever ({quantite}) supérieure au stock réservé ({stock.quantite_reservee})"
                 )
 
-            # Prélèvement en deux étapes :
-            # 1. D'abord le stock disponible
-            if stock_disponible_a_prelever > 0:
-                self.quantite -= stock_disponible_a_prelever
-
-            # 2. Puis le stock réservé
-            self.quantite -= quantite_restante
-            self.quantite_reservee -= quantite_restante
-
-        self.save()
+            # Mettre à jour les quantités
+            StockEntrepot.objects.filter(id=self.id).update(
+                quantite=models.F('quantite') - quantite,
+                quantite_reservee=models.F('quantite_reservee') - quantite,
+                updated_at=timezone.now()
+            )
+            self.refresh_from_db()
 
     def __str__(self):
-        return f"{self.produit.nom} - {self.entrepot.nom}: {self.quantite_disponible}"
-# MAINTENANT MouvementStock peut référencer Entrepot
+        return f"{self.produit.nom} - {self.entrepot.nom}: {self.quantite_disponible} disponible(s)"
 
 
 class MouvementStock(models.Model):
@@ -296,7 +292,7 @@ class MouvementStock(models.Model):
         ('entree', 'Entrée en stock'),
         ('sortie', 'Sortie de stock'),
         ('ajustement', 'Ajustement'),
-        ('transfert', 'Transfert entrepôt'),  # Ajout
+        ('transfert', 'Transfert entrepôt'),
     )
 
     produit = models.ForeignKey(Produit, on_delete=models.CASCADE)
@@ -306,7 +302,7 @@ class MouvementStock(models.Model):
         max_digits=10, decimal_places=2, null=True, blank=True
     )
     motif = models.TextField()
-    entrepot = models.ForeignKey(  # Ajout
+    entrepot = models.ForeignKey(
         Entrepot, on_delete=models.CASCADE, null=True, blank=True)
     created_by = models.ForeignKey(
         CustomUser, on_delete=models.SET_NULL, null=True
@@ -325,8 +321,6 @@ class MouvementStock(models.Model):
         entrepot_str = f" ({self.entrepot.nom})" if self.entrepot else ""
         return f"{self.produit.nom} - {self.type_mouvement}{entrepot_str} ({self.quantite})"
 
-
-# models.py - Ajoutez ces modèles après le modèle Vente
 
 class Vente(models.Model):
     STATUT_VENTE = (
@@ -373,10 +367,8 @@ class Vente(models.Model):
         max_digits=12, decimal_places=2, default=0
     )
     remise = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    date_echeance = models.DateField(
-        null=True, blank=True)  # Date limite de paiement
-    date_paiement = models.DateTimeField(
-        null=True, blank=True)  # Date de paiement complet
+    date_echeance = models.DateField(null=True, blank=True)
+    date_paiement = models.DateTimeField(null=True, blank=True)
     entrepots = models.ManyToManyField(Entrepot, blank=True)
     notes = models.TextField(blank=True)
     created_by = models.ForeignKey(
@@ -423,26 +415,25 @@ class Vente(models.Model):
             raise ValueError(
                 "Seules les ventes brouillon peuvent être confirmées")
 
-        self.statut = 'confirmee'
+        with transaction.atomic():
+            self.statut = 'confirmee'
+            self.save()
 
-        # Prélever le stock pour chaque ligne de vente
-        for ligne in self.lignes_vente.all():
-            # Prélever le stock de l'entrepôt
-            ligne.prelever_stock_entrepot()
+            # Prélever le stock pour chaque ligne de vente
+            for ligne in self.lignes_vente.all():
+                ligne.prelever_stock_entrepot()
 
-            # CRÉER LE MOUVEMENT DE STOCK POUR LA SORTIE
-            MouvementStock.objects.create(
-                produit=ligne.produit,
-                type_mouvement='sortie',
-                quantite=ligne.quantite,
-                prix_unitaire=ligne.prix_unitaire,
-                motif=f"Vente {self.numero_vente}" +
-                (f" - Client: {self.client.nom}" if self.client else ""),
-                entrepot=ligne.entrepot,
-                created_by=self.created_by
-            )
-
-        self.save()
+                # Créer le mouvement de stock
+                MouvementStock.objects.create(
+                    produit=ligne.produit,
+                    type_mouvement='sortie',
+                    quantite=ligne.quantite,
+                    prix_unitaire=ligne.prix_unitaire,
+                    motif=f"Vente {self.numero_vente}" +
+                    (f" - Client: {self.client.nom}" if self.client else ""),
+                    entrepot=ligne.entrepot,
+                    created_by=self.created_by
+                )
 
         # Log d'audit
         AuditLog.objects.create(
@@ -458,54 +449,39 @@ class Vente(models.Model):
             }
         )
 
-    def save(self, *args, **kwargs):
-        # Calculer le montant total si la vente existe déjà
-        if self.pk:
-            self.montant_total = self.calculer_total()
-
-        # Calculer le montant restant
-        self.montant_restant = self.montant_total - self.montant_paye
-
-        # Mettre à jour le statut de paiement
+    def update_statut_paiement(self):
+        """Mettre à jour le statut de paiement"""
         if self.montant_paye == 0:
             self.statut_paiement = 'non_paye'
-        elif self.montant_paye < self.montant_total:
-            self.statut_paiement = 'partiel'
-        else:
+        elif self.montant_paye >= self.montant_total:
             self.statut_paiement = 'paye'
             self.date_paiement = timezone.now()
-
-        super().save(*args, **kwargs)
+        else:
+            self.statut_paiement = 'partiel'
+        self.save()
 
     def ajouter_paiement(self, montant, mode_paiement, reference='', notes='', user=None):
         """Ajouter un paiement à la vente"""
-        # Créer l'objet Paiement
-        paiement = Paiement.objects.create(
-            vente=self,
-            montant=montant,
-            mode_paiement=mode_paiement,
-            reference=reference,
-            notes=notes,
-            created_by=user or self.created_by
-        )
+        with transaction.atomic():
+            # Créer l'objet Paiement
+            paiement = Paiement.objects.create(
+                vente=self,
+                montant=montant,
+                mode_paiement=mode_paiement,
+                reference=reference,
+                notes=notes,
+                created_by=user or self.created_by
+            )
 
-        # Mettre à jour le montant payé
-        self.montant_paye += montant
+            # Mettre à jour le montant payé
+            self.montant_paye += montant
 
-        # Si la vente n'a pas de mode de paiement principal, utiliser celui du premier paiement
-        if not self.mode_paiement:
-            self.mode_paiement = mode_paiement
+            # Si la vente n'a pas de mode de paiement principal, utiliser celui du premier paiement
+            if not self.mode_paiement:
+                self.mode_paiement = mode_paiement
 
-        # Mettre à jour le statut de paiement
-        if self.montant_paye >= self.montant_total:
-            self.statut_paiement = 'paye'
-            self.date_paiement = timezone.now()
-        elif self.montant_paye > 0:
-            self.statut_paiement = 'partiel'
-        else:
-            self.statut_paiement = 'non_paye'
-
-        self.save()
+            # Mettre à jour le statut de paiement
+            self.update_statut_paiement()
 
         # Log d'audit
         AuditLog.objects.create(
@@ -525,13 +501,11 @@ class Vente(models.Model):
 
 
 class Paiement(models.Model):
-    """Historique des paiements pour chaque vente"""
     vente = models.ForeignKey(
         Vente, on_delete=models.CASCADE, related_name='paiements')
     montant = models.DecimalField(max_digits=12, decimal_places=2)
     mode_paiement = models.CharField(
         max_length=20, choices=Vente.MODE_PAIEMENT)
-    # Numéro de chèque, référence virement, etc.
     reference = models.CharField(max_length=100, blank=True)
     date_paiement = models.DateTimeField(auto_now_add=True)
     notes = models.TextField(blank=True)
@@ -546,15 +520,13 @@ class Paiement(models.Model):
 
 
 class Facture(models.Model):
-    """Modèle pour générer des factures PDF"""
     vente = models.OneToOneField(
         Vente, on_delete=models.CASCADE, related_name='facture')
     numero_facture = models.CharField(max_length=50, unique=True)
     date_facture = models.DateField(auto_now_add=True)
     montant_ht = models.DecimalField(
         max_digits=12, decimal_places=2, default=0)
-    tva = models.DecimalField(
-        max_digits=10, decimal_places=2, default=0)  # Taux TVA
+    tva = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     montant_ttc = models.DecimalField(
         max_digits=12, decimal_places=2, default=0)
     pdf_facture = models.FileField(
@@ -564,34 +536,17 @@ class Facture(models.Model):
 
     def __str__(self):
         return f"Facture {self.numero_facture} - {self.vente.numero_vente}"
-# IL Y A 2 DÉFINITIONS DE LigneDeVente ! Supprimez celle-ci (l'ancienne)
-# class LigneDeVente(models.Model):
-#     vente = models.ForeignKey(
-#         Vente, on_delete=models.CASCADE, related_name='lignes_vente')
-#     produit = models.ForeignKey(Produit, on_delete=models.CASCADE)
-#     quantite = models.IntegerField()
-#     prix_unitaire = models.DecimalField(max_digits=10, decimal_places=2)
-
-#     def sous_total(self):
-#         return self.quantite * self.prix_unitaire
-
-#     def __str__(self):
-#         return f"{self.produit.nom} x{self.quantite}"
-
-# Gardez SEULEMENT cette définition (la nouvelle avec entrepot)
 
 
 class LigneDeVente(models.Model):
-    """Modifier le modèle existant pour inclure l'entrepôt"""
     vente = models.ForeignKey(
         Vente, on_delete=models.CASCADE, related_name='lignes_vente'
     )
     produit = models.ForeignKey(Produit, on_delete=models.CASCADE)
-    entrepot = models.ForeignKey(Entrepot, on_delete=models.CASCADE)  # Ajout
+    entrepot = models.ForeignKey(Entrepot, on_delete=models.CASCADE)
     quantite = models.IntegerField()
     prix_unitaire = models.DecimalField(max_digits=10, decimal_places=2)
-    stock_preleve = models.BooleanField(
-        default=False)  # Si le stock a été prélevé
+    stock_preleve = models.BooleanField(default=False)
 
     def sous_total(self):
         return self.quantite * self.prix_unitaire
@@ -599,23 +554,26 @@ class LigneDeVente(models.Model):
     def prelever_stock_entrepot(self):
         """Prélever le stock de l'entrepôt"""
         if not self.stock_preleve:
-            stock_entrepot = StockEntrepot.objects.get(
-                entrepot=self.entrepot,
-                produit=self.produit
-            )
-            stock_entrepot.prelever_stock(self.quantite)
-            self.stock_preleve = True
-            self.save()
+            try:
+                stock_entrepot = StockEntrepot.objects.get(
+                    entrepot=self.entrepot,
+                    produit=self.produit
+                )
+                stock_entrepot.prelever_stock(self.quantite)
+                self.stock_preleve = True
+                self.save()
+            except StockEntrepot.DoesNotExist:
+                raise ValueError(
+                    f"Stock non trouvé pour {self.produit.nom} dans {self.entrepot.nom}")
 
     def __str__(self):
         return f"{self.produit.nom} x{self.quantite} ({self.entrepot.nom})"
 
 
 class TransfertEntrepot(models.Model):
-    """Modèle pour les transferts entre entrepôts"""
     STATUT_TRANSFERT = (
         ('brouillon', 'Brouillon'),
-        ('confirme', 'Confirmé'),  # Changé de 'confirmee' à 'confirme'
+        ('confirme', 'Confirmé'),
         ('annule', 'Annulé'),
     )
 
@@ -639,41 +597,41 @@ class TransfertEntrepot(models.Model):
     def confirmer_transfert(self):
         """Confirmer le transfert et mettre à jour les stocks"""
         if self.statut == 'brouillon':
-            for ligne in self.lignes_transfert.all():
-                # Réduire le stock source
-                stock_source = StockEntrepot.objects.get(
-                    entrepot=self.entrepot_source,
-                    produit=ligne.produit
-                )
-                stock_source.quantite -= ligne.quantite
-                stock_source.save()
+            with transaction.atomic():
+                for ligne in self.lignes_transfert.all():
+                    # Réduire le stock source
+                    stock_source = StockEntrepot.objects.get(
+                        entrepot=self.entrepot_source,
+                        produit=ligne.produit
+                    )
+                    stock_source.quantite -= ligne.quantite
+                    stock_source.save()
 
-                # Augmenter le stock destination
-                stock_dest, created = StockEntrepot.objects.get_or_create(
-                    entrepot=self.entrepot_destination,
-                    produit=ligne.produit,
-                    defaults={'quantite': 0}
-                )
-                stock_dest.quantite += ligne.quantite
-                stock_dest.save()
+                    # Augmenter le stock destination
+                    stock_dest, created = StockEntrepot.objects.get_or_create(
+                        entrepot=self.entrepot_destination,
+                        produit=ligne.produit,
+                        defaults={'quantite': 0}
+                    )
+                    stock_dest.quantite += ligne.quantite
+                    stock_dest.save()
 
-                # Créer un mouvement de stock
-                MouvementStock.objects.create(
-                    produit=ligne.produit,
-                    type_mouvement='transfert',
-                    quantite=ligne.quantite,
-                    prix_unitaire=ligne.produit.prix_achat,
-                    motif=f"Transfert {self.reference}",
-                    created_by=self.created_by
-                )
+                    # Créer un mouvement de stock
+                    MouvementStock.objects.create(
+                        produit=ligne.produit,
+                        type_mouvement='transfert',
+                        quantite=ligne.quantite,
+                        prix_unitaire=ligne.produit.prix_achat,
+                        motif=f"Transfert {self.reference}",
+                        created_by=self.created_by
+                    )
 
-            self.statut = 'confirme'
-            self.confirme_at = timezone.now()
-            self.save()
+                self.statut = 'confirme'
+                self.confirme_at = timezone.now()
+                self.save()
 
 
 class LigneTransfert(models.Model):
-    """Lignes de transfert entre entrepôts"""
     transfert = models.ForeignKey(
         TransfertEntrepot, on_delete=models.CASCADE, related_name='lignes_transfert'
     )
@@ -770,15 +728,12 @@ def log_client_save(sender, instance, created, **kwargs):
     )
 
 
-# Signal pour le reset de password (conservé)
+# Signal pour le reset de password
 @receiver(reset_password_token_created)
 def password_reset_token_created(reset_password_token, *args, **kwargs):
     sitelink = "http://localhost:5173/"
     token = "{}".format(reset_password_token.key)
     full_link = str(sitelink) + str("password-reset/") + str(token)
-
-    print(f"Token de reset: {token}")
-    print(f"Lien de reset: {full_link}")
 
     context = {
         'full_link': full_link,
