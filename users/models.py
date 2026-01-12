@@ -309,7 +309,6 @@ class MouvementStock(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
-
     def save(self, *args, **kwargs):
         if not self.prix_unitaire:
             if self.type_mouvement == 'entree':
@@ -728,6 +727,44 @@ def log_client_save(sender, instance, created, **kwargs):
         }
     )
 
+
+@receiver(post_save, sender=MouvementStock)
+def update_stock_simple(sender, instance, created, **kwargs):
+    """
+    Version simple pour mettre à jour le stock
+    """
+    if not created or not instance.entrepot:
+        return
+    
+    try:
+        with transaction.atomic():
+            # Récupérer l'entrée StockEntrepot
+            stock, created_stock = StockEntrepot.objects.get_or_create(
+                entrepot=instance.entrepot,
+                produit=instance.produit,
+                defaults={'quantite': 0}
+            )
+            
+            # Sauvegarder l'ancienne valeur pour le log
+            ancien_stock = stock.quantite
+            
+            # Appliquer la modification
+            if instance.type_mouvement == 'entree':
+                stock.quantite += instance.quantite
+            elif instance.type_mouvement == 'sortie':
+                stock.quantite = max(0, stock.quantite - instance.quantite)
+            elif instance.type_mouvement == 'ajustement':
+                stock.quantite = instance.quantite
+            
+            # Sauvegarder
+            stock.save()
+            
+            print(f"✅ Stock mis à jour: {instance.produit.nom} dans {instance.entrepot.nom}")
+            print(f"   Ancien: {ancien_stock}, Mouvement: {instance.quantite} ({instance.type_mouvement})")
+            print(f"   Nouveau: {stock.quantite}")
+            
+    except Exception as e:
+        print(f"❌ Erreur update_stock_simple: {e}")
 
 # Signal pour le reset de password
 @receiver(reset_password_token_created)
