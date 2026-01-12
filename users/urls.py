@@ -22,6 +22,7 @@ router.register('stock-entrepot', StockEntrepotViewSet,
                 basename='stock-entrepot')
 router.register('transferts', TransfertEntrepotViewSet, basename='transferts')
 router.register('ventes', VenteViewSet, basename='ventes')
+router.register('point-de-vente', VenteViewSet, basename='point-de-vente')
 router.register('dashboard', DashboardViewSet, basename='dashboard')
 router.register('audit-logs', AuditLogViewSet, basename='audit-logs')
 router.register('rapports', RapportsViewSet, basename='rapports')
