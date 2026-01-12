@@ -719,6 +719,52 @@ class VenteViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+    def destroy(self, request, pk=None):
+        """Surcharger la suppression pour libérer le stock réservé"""
+        try:
+            with transaction.atomic():
+                vente = self.get_object()
+
+                # Libérer le stock réservé si la vente est en brouillon
+                if vente.statut == 'brouillon':
+                    stocks_libérés = []
+                    for ligne in vente.lignes_vente.all():
+                        try:
+                            stock_entrepot = StockEntrepot.objects.get(
+                                entrepot=ligne.entrepot,
+                                produit=ligne.produit
+                            )
+
+                            ancienne_reserve = stock_entrepot.quantite_reservee
+                            nouvelle_reserve = max(
+                                0, ancienne_reserve - ligne.quantite)
+                            stock_entrepot.quantite_reservee = nouvelle_reserve
+                            stock_entrepot.save()
+
+                            stocks_libérés.append({
+                                'produit': ligne.produit.nom,
+                                'entrepot': ligne.entrepot.nom,
+                                'quantite': ligne.quantite,
+                                'ancienne_reserve': ancienne_reserve,
+                                'nouvelle_reserve': nouvelle_reserve
+                            })
+
+                        except StockEntrepot.DoesNotExist:
+                            continue
+
+                # Supprimer la vente
+                vente.delete()
+
+                return Response({
+                    'message': 'Vente supprimée avec succès',
+                    'stocks_libérés': stocks_libérés
+                }, status=status.HTTP_200_OK)
+
+        except Vente.DoesNotExist:
+            return Response({'error': 'Vente non trouvée'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
     @action(detail=False, methods=['get'])
     def statistiques(self, request):
         user = request.user

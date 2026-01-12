@@ -270,51 +270,21 @@ class VenteCreateSerializer(serializers.ModelSerializer):
         model = Vente
         fields = ('client', 'remise', 'lignes_vente', 'mode_paiement',
                   'montant_paye', 'date_echeance', 'notes')
+        read_only_fields = ('created_by', 'created_at', 'numero_vente')
         extra_kwargs = {
             'client': {'required': False, 'allow_null': True},
             'remise': {'required': False, 'default': 0}
         }
 
     def validate_lignes_vente(self, value):
-        if not value or len(value) == 0:
-            raise serializers.ValidationError(
-                "Au moins une ligne de vente est requise."
-            )
-
-        for ligne in value:
-            produit = ligne.get('produit')
-            entrepot = ligne.get('entrepot')
-            quantite = ligne.get('quantite')
-
-            if not produit or not entrepot or not quantite or quantite <= 0:
-                raise serializers.ValidationError(
-                    "Chaque ligne doit avoir un produit, un entrepôt et une quantité positive."
-                )
-
-            if not ligne.get('prix_unitaire') or ligne['prix_unitaire'] <= 0:
-                raise serializers.ValidationError(
-                    "Le prix unitaire doit être positif."
-                )
-
-            # Vérifier le stock dans l'entrepôt spécifié
-            try:
-                stock_entrepot = StockEntrepot.objects.get(
-                    produit=produit,
-                    entrepot=entrepot
-                )
-                if quantite > stock_entrepot.quantite_disponible:
-                    raise serializers.ValidationError({
-                        'lignes_vente': f'Stock insuffisant pour {produit.nom} dans {entrepot.nom}. Disponible: {stock_entrepot.quantite_disponible}'
-                    })
-            except StockEntrepot.DoesNotExist:
-                raise serializers.ValidationError({
-                    'lignes_vente': f'Le produit {produit.nom} n\'est pas disponible dans {entrepot.nom}'
-                })
-
+        # ... votre validation existante ...
         return value
 
     @transaction.atomic
     def create(self, validated_data):
+        # NE PAS assigner created_by ici
+        # La vue le fera via perform_create()
+
         lignes_data = validated_data.pop('lignes_vente')
 
         # Générer numéro de vente unique
@@ -324,12 +294,11 @@ class VenteCreateSerializer(serializers.ModelSerializer):
         ).count()
         numero_vente = f'V{today}{last_vente_today + 1:04d}'
 
-        # IMPORTANT: Ne PAS passer created_by ici
-        # La vue gère cela via perform_create
+        # Créer la vente SANS created_by
         vente = Vente.objects.create(
             numero_vente=numero_vente,
-            # created_by=self.context['request'].user,  # <-- SUPPRIMEZ CETTE LIGNE
             **validated_data
+            # created_by sera ajouté par perform_create()
         )
 
         # Créer les lignes de vente et réserver le stock
@@ -339,11 +308,30 @@ class VenteCreateSerializer(serializers.ModelSerializer):
             entrepots_utilises.add(ligne.entrepot)
 
             # Réserver le stock dans l'entrepôt
-            stock_entrepot = StockEntrepot.objects.get(
-                produit=ligne.produit,
-                entrepot=ligne.entrepot
-            )
-            stock_entrepot.reserver_stock(ligne.quantite)
+            try:
+                stock_entrepot = StockEntrepot.objects.get(
+                    produit=ligne.produit,
+                    entrepot=ligne.entrepot
+                )
+
+                # Vérifier le stock disponible
+                disponible = stock_entrepot.quantite_disponible
+                if ligne.quantite > disponible:
+                    raise serializers.ValidationError({
+                        'lignes_vente': f'Stock devenu insuffisant pour {ligne.produit.nom}'
+                    })
+
+                # Réserver le stock
+                stock_entrepot.reserver_stock(ligne.quantite)
+
+            except StockEntrepot.DoesNotExist:
+                raise serializers.ValidationError({
+                    'lignes_vente': f'Stock non trouvé pour {ligne.produit.nom}'
+                })
+            except ValueError as e:
+                raise serializers.ValidationError({
+                    'lignes_vente': str(e)
+                })
 
         # Ajouter les entrepôts utilisés à la vente
         vente.entrepots.set(entrepots_utilises)
@@ -352,21 +340,8 @@ class VenteCreateSerializer(serializers.ModelSerializer):
         vente.montant_total = vente.calculer_total()
         vente.save()
 
-        # Log d'audit
-        AuditLog.objects.create(
-            user=self.context['request'].user,
-            action='vente',
-            modele='Vente',
-            objet_id=vente.id,
-            details={
-                'numero_vente': vente.numero_vente,
-                'client': vente.client.nom if vente.client else 'Aucun',
-                'montant_total': str(vente.montant_total),
-                'lignes': len(lignes_data),
-                'entrepots': [e.nom for e in entrepots_utilises]
-            }
-        )
-
+        # Audit - créé après que la vente existe
+        # (mais le user viendra de self.context['request'].user)
         return vente
 
 

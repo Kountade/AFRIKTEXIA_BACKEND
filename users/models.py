@@ -1,3 +1,4 @@
+from django.db.models.signals import pre_delete
 from django.db.models.signals import post_save, post_delete
 from django.db import models
 from django.contrib.auth.models import AbstractUser
@@ -295,6 +296,17 @@ class MouvementStock(models.Model):
         ('transfert', 'Transfert entrepôt'),
     )
 
+    # AJOUT: Choix pour la source du mouvement
+    SOURCE_CHOICES = (
+        ('manuel', 'Manuel (interface)'),
+        ('vente', 'Vente'),
+        ('transfert', 'Transfert entrepôts'),
+        ('inventaire', 'Inventaire'),
+        ('ajustement_auto', 'Ajustement automatique'),
+        ('retour', 'Retour client'),
+        ('autre', 'Autre'),
+    )
+
     produit = models.ForeignKey(Produit, on_delete=models.CASCADE)
     type_mouvement = models.CharField(max_length=20, choices=TYPE_MOUVEMENT)
     quantite = models.IntegerField()
@@ -302,6 +314,32 @@ class MouvementStock(models.Model):
         max_digits=10, decimal_places=2, null=True, blank=True
     )
     motif = models.TextField()
+
+    # AJOUT: Champ pour identifier la source
+    source = models.CharField(
+        max_length=20,
+        choices=SOURCE_CHOICES,
+        default='manuel'
+    )
+
+    # AJOUT: Lien optionnel vers la vente (pour le suivi)
+    vente = models.ForeignKey(
+        'Vente',  # Utilisez une string pour éviter les problèmes d'import circulaire
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='mouvements_stock'
+    )
+
+    # AJOUT: Lien optionnel vers le transfert (pour le suivi)
+    transfert = models.ForeignKey(
+        'TransfertEntrepot',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='mouvements_stock'
+    )
+
     entrepot = models.ForeignKey(
         Entrepot, on_delete=models.CASCADE, null=True, blank=True)
     created_by = models.ForeignKey(
@@ -309,17 +347,58 @@ class MouvementStock(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['produit', 'entrepot']),
+            models.Index(fields=['type_mouvement', 'source']),
+            models.Index(fields=['created_at']),
+            models.Index(fields=['vente']),
+        ]
+
     def save(self, *args, **kwargs):
+        # Calculer le prix unitaire si non fourni
         if not self.prix_unitaire:
             if self.type_mouvement == 'entree':
                 self.prix_unitaire = self.produit.prix_achat
             else:
                 self.prix_unitaire = self.produit.prix_vente
+
+        # Déterminer automatiquement la source si non spécifiée
+        if not self.source or self.source == 'manuel':
+            if 'Vente' in self.motif or 'vente' in self.motif.lower():
+                self.source = 'vente'
+            elif 'Transfert' in self.motif or 'transfert' in self.motif.lower():
+                self.source = 'transfert'
+            elif 'Inventaire' in self.motif or 'inventaire' in self.motif.lower():
+                self.source = 'inventaire'
+            elif 'Ajustement' in self.motif or 'ajustement' in self.motif.lower():
+                self.source = 'ajustement_auto'
+
         super().save(*args, **kwargs)
+
+    @property
+    def valeur_totale(self):
+        """Calculer la valeur totale du mouvement"""
+        if self.prix_unitaire:
+            return self.quantite * self.prix_unitaire
+        return 0
+
+    @property
+    def est_mouvement_vente(self):
+        """Vérifier si c'est un mouvement lié à une vente"""
+        return self.source == 'vente' or self.vente is not None
+
+    @property
+    def description_source(self):
+        """Description lisible de la source"""
+        return dict(self.SOURCE_CHOICES).get(self.source, 'Inconnue')
 
     def __str__(self):
         entrepot_str = f" ({self.entrepot.nom})" if self.entrepot else ""
-        return f"{self.produit.nom} - {self.type_mouvement}{entrepot_str} ({self.quantite})"
+        source_str = f" [{self.get_source_display()}]" if self.source != 'manuel' else ""
+        vente_str = f" V#{self.vente.numero_vente}" if self.vente else ""
+        return f"{self.produit.nom} - {self.get_type_mouvement_display()}{entrepot_str}{source_str}{vente_str} ({self.quantite})"
 
 
 class Vente(models.Model):
@@ -449,6 +528,58 @@ class Vente(models.Model):
             }
         )
 
+    def annuler_et_liberer_stock(self):
+        """Annuler la vente et libérer le stock réservé"""
+        if self.statut == 'annulee':
+            return  # Déjà annulée
+
+        with transaction.atomic():
+            stocks_libérés = []
+
+            # Libérer le stock réservé
+            for ligne in self.lignes_vente.all():
+                try:
+                    stock_entrepot = StockEntrepot.objects.get(
+                        entrepot=ligne.entrepot,
+                        produit=ligne.produit
+                    )
+
+                    # Libérer seulement si la ligne n'a pas déjà prélevé le stock
+                    if not ligne.stock_preleve:
+                        ancienne_reserve = stock_entrepot.quantite_reservee
+                        stock_entrepot.liberer_stock(ligne.quantite)
+
+                        stocks_libérés.append({
+                            'produit': ligne.produit.nom,
+                            'entrepot': ligne.entrepot.nom,
+                            'quantite': ligne.quantite,
+                            'ancienne_reserve': ancienne_reserve,
+                            'nouvelle_reserve': stock_entrepot.quantite_reservee
+                        })
+
+                except StockEntrepot.DoesNotExist:
+                    continue
+
+            # Marquer la vente comme annulée
+            self.statut = 'annulee'
+            self.save()
+
+            # Log d'audit
+            AuditLog.objects.create(
+                user=self.created_by,
+                action='vente',
+                modele='Vente',
+                objet_id=self.id,
+                details={
+                    'action': 'annulation',
+                    'numero_vente': self.numero_vente,
+                    'stocks_libérés': stocks_libérés,
+                    'statut': 'annulee'
+                }
+            )
+
+            return stocks_libérés
+
     def update_statut_paiement(self):
         """Mettre à jour le statut de paiement"""
         if self.montant_paye == 0:
@@ -552,19 +683,48 @@ class LigneDeVente(models.Model):
         return self.quantite * self.prix_unitaire
 
     def prelever_stock_entrepot(self):
-        """Prélever le stock de l'entrepôt"""
-        if not self.stock_preleve:
-            try:
-                stock_entrepot = StockEntrepot.objects.get(
-                    entrepot=self.entrepot,
-                    produit=self.produit
-                )
-                stock_entrepot.prelever_stock(self.quantite)
-                self.stock_preleve = True
-                self.save()
-            except StockEntrepot.DoesNotExist:
+        """Prélever le stock de l'entrepôt (confirmation de vente)"""
+        if self.stock_preleve:
+            print(f"⚠️ Stock déjà prélevé pour cette ligne: {self.id}")
+            return  # Déjà prélevé
+
+        try:
+            stock_entrepot = StockEntrepot.objects.select_for_update().get(
+                entrepot=self.entrepot,
+                produit=self.produit
+            )
+
+            # Vérifier qu'on a assez de stock réservé
+            if self.quantite > stock_entrepot.quantite_reservee:
                 raise ValueError(
-                    f"Stock non trouvé pour {self.produit.nom} dans {self.entrepot.nom}")
+                    f"Quantité à prélever ({self.quantite}) supérieure au stock réservé ({stock_entrepot.quantite_reservee})"
+                )
+
+            # Prélever le stock (déduire du stock total et du stock réservé)
+            stock_entrepot.quantite -= self.quantite
+            stock_entrepot.quantite_reservee -= self.quantite
+
+            # S'assurer que les valeurs ne soient pas négatives
+            stock_entrepot.quantite = max(0, stock_entrepot.quantite)
+            stock_entrepot.quantite_reservee = max(
+                0, stock_entrepot.quantite_reservee)
+
+            stock_entrepot.save()
+
+            # Marquer comme prélevé
+            self.stock_preleve = True
+            self.save()
+
+            print(
+                f"✅ Stock prélevé: {self.produit.nom} - {self.quantite} unités")
+            print(f"   Stock restant: {stock_entrepot.quantite}")
+            print(
+                f"   Stock réservé restant: {stock_entrepot.quantite_reservee}")
+
+        except StockEntrepot.DoesNotExist:
+            raise ValueError(
+                f"Stock non trouvé pour {self.produit.nom} dans {self.entrepot.nom}"
+            )
 
     def __str__(self):
         return f"{self.produit.nom} x{self.quantite} ({self.entrepot.nom})"
@@ -616,13 +776,15 @@ class TransfertEntrepot(models.Model):
                     stock_dest.quantite += ligne.quantite
                     stock_dest.save()
 
-                    # Créer un mouvement de stock
+                    # Créer un mouvement de stock avec source='transfert'
                     MouvementStock.objects.create(
                         produit=ligne.produit,
                         type_mouvement='transfert',
                         quantite=ligne.quantite,
                         prix_unitaire=ligne.produit.prix_achat,
                         motif=f"Transfert {self.reference}",
+                        source='transfert',  # ← NOUVEAU
+                        transfert=self,      # ← NOUVEAU
                         created_by=self.created_by
                     )
 
@@ -729,44 +891,137 @@ def log_client_save(sender, instance, created, **kwargs):
 
 
 @receiver(post_save, sender=MouvementStock)
-def update_stock_simple(sender, instance, created, **kwargs):
+def update_stock_on_mouvement(sender, instance, created, **kwargs):
     """
-    Version simple pour mettre à jour le stock
+    Met à jour le stock dans StockEntrepot lorsqu'un mouvement est créé
+    NE met PAS à jour le stock pour les sorties de vente (gérées ailleurs)
     """
     if not created or not instance.entrepot:
         return
-    
+
     try:
+        # VÉRIFICATION CRITIQUE: Ne pas gérer les sorties de vente ici
+        # Les ventes gèrent leur propre stock via prelever_stock_entrepot()
+        if instance.type_mouvement == 'sortie' and instance.est_mouvement_vente:
+            print(
+                f"📋 Mouvement de vente ignoré (stock géré par la vente): {instance}")
+            return
+
+        # VÉRIFICATION: Ne pas gérer les transferts ici (gérés dans TransfertEntrepot.confirmer_transfert)
+        if instance.type_mouvement == 'transfert':
+            print(
+                f"📋 Mouvement de transfert ignoré (stock géré par le transfert): {instance}")
+            return
+
         with transaction.atomic():
-            # Récupérer l'entrée StockEntrepot
-            stock, created_stock = StockEntrepot.objects.get_or_create(
+            # Récupérer ou créer l'entrée StockEntrepot
+            stock, created_stock = StockEntrepot.objects.select_for_update().get_or_create(
                 entrepot=instance.entrepot,
                 produit=instance.produit,
                 defaults={'quantite': 0}
             )
-            
-            # Sauvegarder l'ancienne valeur pour le log
+
+            # Sauvegarder l'ancienne valeur
             ancien_stock = stock.quantite
-            
-            # Appliquer la modification
+
+            # Appliquer la modification selon le type
             if instance.type_mouvement == 'entree':
-                stock.quantite += instance.quantite
+                nouvelle_quantite = stock.quantite + instance.quantite
+                action = "ajout"
             elif instance.type_mouvement == 'sortie':
-                stock.quantite = max(0, stock.quantite - instance.quantite)
+                nouvelle_quantite = max(0, stock.quantite - instance.quantite)
+                action = "retrait"
             elif instance.type_mouvement == 'ajustement':
-                stock.quantite = instance.quantite
-            
-            # Sauvegarder
+                nouvelle_quantite = instance.quantite
+                action = "définition"
+            else:
+                # Ne devrait pas arriver avec nos vérifications
+                return
+
+            # Mettre à jour le stock
+            stock.quantite = nouvelle_quantite
             stock.save()
-            
-            print(f"✅ Stock mis à jour: {instance.produit.nom} dans {instance.entrepot.nom}")
-            print(f"   Ancien: {ancien_stock}, Mouvement: {instance.quantite} ({instance.type_mouvement})")
-            print(f"   Nouveau: {stock.quantite}")
-            
+
+            # Log détaillé
+            print(f"""
+            🔄 MISE À JOUR DU STOCK
+            ----------------------------
+            Produit:     {instance.produit.nom}
+            Entrepôt:    {instance.entrepot.nom}
+            Type:        {instance.get_type_mouvement_display()}
+            Source:      {instance.get_source_display()}
+            Quantité:    {instance.quantite} ({action})
+            Ancien:      {ancien_stock}
+            Nouveau:     {stock.quantite}
+            Variation:   {stock.quantite - ancien_stock:+d}
+            ----------------------------
+            """)
+
+            # Log d'audit
+            AuditLog.objects.create(
+                user=instance.created_by,
+                action='mouvement_stock' if not instance.est_mouvement_vente else 'vente',
+                modele='StockEntrepot',
+                objet_id=stock.id,
+                details={
+                    'mouvement_id': instance.id,
+                    'produit_id': instance.produit.id,
+                    'produit_nom': instance.produit.nom,
+                    'entrepot_id': instance.entrepot.id,
+                    'entrepot_nom': instance.entrepot.nom,
+                    'type_mouvement': instance.type_mouvement,
+                    'source': instance.source,
+                    'quantite': instance.quantite,
+                    'ancien_stock': ancien_stock,
+                    'nouveau_stock': stock.quantite,
+                    'vente_id': instance.vente.id if instance.vente else None,
+                    'vente_numero': instance.vente.numero_vente if instance.vente else None,
+                    'action': action
+                }
+            )
+
     except Exception as e:
-        print(f"❌ Erreur update_stock_simple: {e}")
+        print(f"❌ ERREUR critique dans update_stock_on_mouvement: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 # Signal pour le reset de password
+
+
+@receiver(pre_delete, sender=Vente)
+def liberer_stock_sur_suppression_vente(sender, instance, **kwargs):
+    """
+    Libérer le stock réservé quand une vente est supprimée (avant confirmation)
+    """
+    if instance.statut == 'brouillon':
+        try:
+            with transaction.atomic():
+                for ligne in instance.lignes_vente.all():
+                    try:
+                        stock_entrepot = StockEntrepot.objects.get(
+                            entrepot=ligne.entrepot,
+                            produit=ligne.produit
+                        )
+                        # Libérer le stock réservé
+                        if ligne.quantite <= stock_entrepot.quantite_reservee:
+                            stock_entrepot.quantite_reservee -= ligne.quantite
+                        else:
+                            # En cas d'erreur, libérer tout ce qui est réservé
+                            stock_entrepot.quantite_reservee = 0
+
+                        stock_entrepot.save()
+
+                        print(
+                            f"✅ Stock libéré: {ligne.produit.nom} - {ligne.quantite} unités")
+
+                    except StockEntrepot.DoesNotExist:
+                        print(f"⚠️ Stock non trouvé pour {ligne.produit.nom}")
+                        continue
+
+        except Exception as e:
+            print(f"❌ Erreur lors de la libération du stock: {e}")
+
+
 @receiver(reset_password_token_created)
 def password_reset_token_created(reset_password_token, *args, **kwargs):
     sitelink = "http://localhost:5173/"
