@@ -309,6 +309,7 @@ class MouvementStock(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
+
     def save(self, *args, **kwargs):
         if not self.prix_unitaire:
             if self.type_mouvement == 'entree':
