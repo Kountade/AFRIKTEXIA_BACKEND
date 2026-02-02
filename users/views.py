@@ -537,16 +537,6 @@ class TransfertEntrepotViewSet(viewsets.ModelViewSet):
             )
 
 
-class IsAdmin(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return request.user.is_authenticated and request.user.role == 'admin'
-
-
-class IsAdminOrVendeur(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return request.user.is_authenticated and request.user.role in ['admin', 'vendeur']
-
-
 class VenteViewSet(viewsets.ModelViewSet):
     """
     ViewSet pour gérer les ventes
@@ -650,6 +640,28 @@ class VenteViewSet(viewsets.ModelViewSet):
                 # Récupérer l'instance créée
                 vente = serializer.instance
 
+                # Réserver le stock pour chaque ligne
+                for ligne in vente.lignes_vente.all():
+                    try:
+                        stock_entrepot = StockEntrepot.objects.get(
+                            produit=ligne.produit,
+                            entrepot=ligne.entrepot
+                        )
+
+                        # Réserver le stock
+                        stock_entrepot.reserver_stock(ligne.quantite)
+
+                        print(
+                            f"✅ Stock réservé: {ligne.produit.nom} - {ligne.quantite} unités")
+                        print(
+                            f"   Stock réservé total: {stock_entrepot.quantite_reservee}")
+
+                    except StockEntrepot.DoesNotExist:
+                        # Annuler la transaction si stock non trouvé
+                        raise serializers.ValidationError({
+                            'lignes_vente': f'Stock non trouvé pour {ligne.produit.nom} dans {ligne.entrepot.nom}'
+                        })
+
                 # Mettre à jour les en-têtes de réponse
                 headers = self.get_success_headers(serializer.data)
 
@@ -694,6 +706,23 @@ class VenteViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
+                # Libérer l'ancien stock avant validation
+                lignes_data = request.data.get('lignes_vente')
+                if lignes_data:
+                    for ancienne_ligne in instance.lignes_vente.all():
+                        try:
+                            stock_entrepot = StockEntrepot.objects.get(
+                                entrepot=ancienne_ligne.entrepot,
+                                produit=ancienne_ligne.produit
+                            )
+                            if not ancienne_ligne.stock_preleve:
+                                stock_entrepot.liberer_stock(
+                                    ancienne_ligne.quantite)
+                                print(
+                                    f"✅ Ancien stock libéré: {ancienne_ligne.produit.nom} - {ancienne_ligne.quantite} unités")
+                        except StockEntrepot.DoesNotExist:
+                            pass
+
                 serializer = self.get_serializer(
                     instance,
                     data=request.data,
@@ -701,6 +730,22 @@ class VenteViewSet(viewsets.ModelViewSet):
                 )
                 serializer.is_valid(raise_exception=True)
                 self.perform_update(serializer)
+
+                # Réserver le nouveau stock si des lignes ont été modifiées
+                if lignes_data:
+                    for nouvelle_ligne in instance.lignes_vente.all():
+                        try:
+                            stock_entrepot = StockEntrepot.objects.get(
+                                produit=nouvelle_ligne.produit,
+                                entrepot=nouvelle_ligne.entrepot
+                            )
+                            if not nouvelle_ligne.stock_preleve:
+                                stock_entrepot.reserver_stock(
+                                    nouvelle_ligne.quantite)
+                                print(
+                                    f"✅ Nouveau stock réservé: {nouvelle_ligne.produit.nom} - {nouvelle_ligne.quantite} unités")
+                        except StockEntrepot.DoesNotExist:
+                            pass
 
                 return Response(serializer.data)
 
@@ -741,17 +786,28 @@ class VenteViewSet(viewsets.ModelViewSet):
                             produit=ligne.produit
                         )
 
-                        ancienne_reserve = stock_entrepot.quantite_reservee
-                        nouvelle_reserve = max(
-                            0, ancienne_reserve - ligne.quantite)
-                        stock_entrepot.quantite_reservee = nouvelle_reserve
-                        stock_entrepot.save()
+                        # Libérer seulement si pas déjà prélevé
+                        if not ligne.stock_preleve:
+                            ancienne_reserve = stock_entrepot.quantite_reservee
 
-                        stocks_liberes.append({
-                            'produit': ligne.produit.nom,
-                            'entrepot': ligne.entrepot.nom,
-                            'quantite': ligne.quantite
-                        })
+                            # S'assurer qu'on ne libère pas plus que ce qui est réservé
+                            if ligne.quantite <= stock_entrepot.quantite_reservee:
+                                stock_entrepot.quantite_reservee -= ligne.quantite
+                            else:
+                                stock_entrepot.quantite_reservee = 0
+
+                            stock_entrepot.save()
+
+                            stocks_liberes.append({
+                                'produit': ligne.produit.nom,
+                                'entrepot': ligne.entrepot.nom,
+                                'quantite': ligne.quantite,
+                                'ancienne_reserve': ancienne_reserve,
+                                'nouvelle_reserve': stock_entrepot.quantite_reservee
+                            })
+
+                            print(
+                                f"✅ Stock libéré (suppression): {ligne.produit.nom} - {ligne.quantite} unités")
 
                     except StockEntrepot.DoesNotExist:
                         continue
@@ -765,7 +821,8 @@ class VenteViewSet(viewsets.ModelViewSet):
                     details={
                         'numero_vente': vente.numero_vente,
                         'montant_total': str(vente.montant_total),
-                        'stocks_liberes': stocks_liberes
+                        'stocks_liberes': stocks_liberes,
+                        'statut': vente.statut
                     }
                 )
 
@@ -818,7 +875,8 @@ class VenteViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Vérifier le stock disponible
+                # Vérifier le stock disponible et prélèvement
+                mouvements_crees = []
                 for ligne in vente.lignes_vente.all():
                     try:
                         stock_entrepot = StockEntrepot.objects.get(
@@ -826,12 +884,42 @@ class VenteViewSet(viewsets.ModelViewSet):
                             entrepot=ligne.entrepot
                         )
 
-                        disponible = stock_entrepot.quantite_disponible
-                        if ligne.quantite > disponible:
+                        # Vérifier le stock réservé (doit correspondre à la quantité)
+                        if ligne.quantite > stock_entrepot.quantite_reservee:
                             return Response(
-                                {"error": f"Stock insuffisant pour {ligne.produit.nom} dans {ligne.entrepot.nom}"},
+                                {"error": f"Quantité réservée insuffisante pour {ligne.produit.nom} dans {ligne.entrepot.nom}"},
                                 status=status.HTTP_400_BAD_REQUEST
                             )
+
+                        # PRÉLÈVER LE STOCK (déduire du stock total et du stock réservé)
+                        stock_entrepot.quantite -= ligne.quantite
+                        stock_entrepot.quantite_reservee -= ligne.quantite
+                        stock_entrepot.save()
+
+                        # Marquer la ligne comme prélevée
+                        ligne.stock_preleve = True
+                        ligne.save()
+
+                        # Créer un mouvement de stock
+                        mouvement = MouvementStock.objects.create(
+                            produit=ligne.produit,
+                            type_mouvement='sortie',
+                            quantite=ligne.quantite,
+                            prix_unitaire=ligne.prix_unitaire,
+                            motif=f"Vente confirmée {vente.numero_vente}" +
+                            (f" - Client: {vente.client.nom}" if vente.client else ""),
+                            source='vente',
+                            vente=vente,
+                            entrepot=ligne.entrepot,
+                            created_by=request.user
+                        )
+                        mouvements_crees.append(mouvement.id)
+
+                        print(
+                            f"✅ Stock prélevé: {ligne.produit.nom} - {ligne.quantite} unités")
+                        print(f"   Stock restant: {stock_entrepot.quantite}")
+                        print(
+                            f"   Stock réservé restant: {stock_entrepot.quantite_reservee}")
 
                     except StockEntrepot.DoesNotExist:
                         return Response(
@@ -854,7 +942,9 @@ class VenteViewSet(viewsets.ModelViewSet):
                     details={
                         'numero_vente': vente.numero_vente,
                         'montant_total': str(vente.montant_total),
-                        'statut_paiement': vente.statut_paiement
+                        'statut_paiement': vente.statut_paiement,
+                        'nombre_lignes': vente.lignes_vente.count(),
+                        'mouvements_crees': mouvements_crees
                     }
                 )
 
@@ -897,50 +987,12 @@ class VenteViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Libérer le stock réservé
-                stocks_liberes = []
-                for ligne in vente.lignes_vente.all():
-                    try:
-                        stock_entrepot = StockEntrepot.objects.get(
-                            produit=ligne.produit,
-                            entrepot=ligne.entrepot
-                        )
-
-                        stock_entrepot.quantite_reservee = max(
-                            0, stock_entrepot.quantite_reservee - ligne.quantite
-                        )
-                        stock_entrepot.save()
-
-                        stocks_liberes.append({
-                            'produit': ligne.produit.nom,
-                            'entrepot': ligne.entrepot.nom,
-                            'quantite': ligne.quantite
-                        })
-
-                    except StockEntrepot.DoesNotExist:
-                        continue
-
-                # Annuler la vente
-                vente.statut = 'annulee'
-                vente.date_annulation = timezone.now()
-                vente.annule_par = request.user
-                vente.save()
-
-                # Créer un log d'audit
-                AuditLog.objects.create(
-                    user=request.user,
-                    action='annulation',
-                    modele='Vente',
-                    objet_id=vente.id,
-                    details={
-                        'numero_vente': vente.numero_vente,
-                        'stocks_liberes': stocks_liberes
-                    }
-                )
+                # Utiliser la méthode du modèle
+                stocks_libérés = vente.annuler_et_liberer_stock()
 
                 return Response({
                     "message": "Vente annulée avec succès",
-                    "stocks_liberes": stocks_liberes,
+                    "stocks_libérés": stocks_libérés,
                     "vente": VenteDetailSerializer(vente).data
                 }, status=status.HTTP_200_OK)
 
@@ -1019,8 +1071,8 @@ class VenteViewSet(viewsets.ModelViewSet):
                 AuditLog.objects.create(
                     user=request.user,
                     action='paiement',
-                    modele='Vente',
-                    objet_id=vente.id,
+                    modele='Paiement',
+                    objet_id=paiement.id,
                     details={
                         'numero_vente': vente.numero_vente,
                         'montant_paye': str(data['montant']),

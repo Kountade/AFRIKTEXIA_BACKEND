@@ -125,14 +125,6 @@ class Produit(models.Model):
     class Meta:
         ordering = ['-created_at']
 
-    def save(self, *args, **kwargs):
-        # Pour la compatibilité, remplir prix_vente si vide
-        if not self.prix_vente:
-            self.prix_vente = self.prix_vente_detail
-        super().save(*args, **kwargs)
-
-    # ... reste des méthodes existantes
-
     def stock_actuel(self):
         """Stock total dans tous les entrepôts"""
         total = StockEntrepot.objects.filter(produit=self).aggregate(
@@ -445,15 +437,6 @@ class Vente(models.Model):
         ('detail', 'Détail'),
     )
 
-    # ... [autres champs]
-
-    # Ajouter default dans le modèle aussi
-    type_vente = models.CharField(
-        max_length=10,
-        choices=TYPE_VENTE,
-        default='detail'  # ← default ici
-    )
-
     client = models.ForeignKey(
         Client, on_delete=models.SET_NULL, null=True, blank=True
     )
@@ -492,10 +475,32 @@ class Vente(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # Nouveaux champs pour le suivi
+    date_confirmation = models.DateTimeField(null=True, blank=True)
+    confirmed_by = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='ventes_confirmees'
+    )
+    date_annulation = models.DateTimeField(null=True, blank=True)
+    annule_par = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='ventes_annulees'
+    )
+    montant_avant_remise = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0
+    )
+    montant_remise = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0
+    )
+
     class Meta:
         ordering = ['-created_at']
-
-    # ... reste des méthodes
 
     def save(self, *args, **kwargs):
         # Calculer le montant restant
@@ -535,6 +540,8 @@ class Vente(models.Model):
 
         with transaction.atomic():
             self.statut = 'confirmee'
+            self.date_confirmation = timezone.now()
+            self.confirmed_by = self.created_by
             self.save()
 
             # Prélever le stock pour chaque ligne de vente
@@ -556,11 +563,10 @@ class Vente(models.Model):
         # Log d'audit
         AuditLog.objects.create(
             user=self.created_by,
-            action='vente',
+            action='confirmation',
             modele='Vente',
             objet_id=self.id,
             details={
-                'action': 'confirmation',
                 'numero_vente': self.numero_vente,
                 'client': self.client.nom if self.client else 'Aucun',
                 'mouvements_crees': self.lignes_vente.count()
@@ -570,7 +576,7 @@ class Vente(models.Model):
     def annuler_et_liberer_stock(self):
         """Annuler la vente et libérer le stock réservé"""
         if self.statut == 'annulee':
-            return  # Déjà annulée
+            return []  # Déjà annulée
 
         with transaction.atomic():
             stocks_libérés = []
@@ -586,7 +592,14 @@ class Vente(models.Model):
                     # Libérer seulement si la ligne n'a pas déjà prélevé le stock
                     if not ligne.stock_preleve:
                         ancienne_reserve = stock_entrepot.quantite_reservee
-                        stock_entrepot.liberer_stock(ligne.quantite)
+
+                        # S'assurer qu'on ne libère pas plus que ce qui est réservé
+                        if ligne.quantite <= stock_entrepot.quantite_reservee:
+                            stock_entrepot.quantite_reservee -= ligne.quantite
+                        else:
+                            stock_entrepot.quantite_reservee = 0
+
+                        stock_entrepot.save()
 
                         stocks_libérés.append({
                             'produit': ligne.produit.nom,
@@ -601,16 +614,17 @@ class Vente(models.Model):
 
             # Marquer la vente comme annulée
             self.statut = 'annulee'
+            self.date_annulation = timezone.now()
+            self.annule_par = self.created_by
             self.save()
 
-            # Log d'audit
+            # Créer un log d'audit
             AuditLog.objects.create(
                 user=self.created_by,
-                action='vente',
+                action='annulation',
                 modele='Vente',
                 objet_id=self.id,
                 details={
-                    'action': 'annulation',
                     'numero_vente': self.numero_vente,
                     'stocks_libérés': stocks_libérés,
                     'statut': 'annulee'
@@ -656,7 +670,7 @@ class Vente(models.Model):
         # Log d'audit
         AuditLog.objects.create(
             user=user or self.created_by,
-            action='vente',
+            action='paiement',
             modele='Paiement',
             objet_id=paiement.id,
             details={
@@ -668,6 +682,9 @@ class Vente(models.Model):
         )
 
         return paiement
+
+    def __str__(self):
+        return f"Vente {self.numero_vente} - {self.get_statut_display()} - {self.montant_total}"
 
 
 class Paiement(models.Model):
@@ -721,25 +738,33 @@ class LigneDeVente(models.Model):
     # Nouveau: marquer si c'est un prix de gros ou détail
     est_prix_gros = models.BooleanField(default=False)
 
+    # Nouveau: pour stocker le montant total de la ligne
+    montant_total = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0
+    )
+
+    class Meta:
+        ordering = ['id']
+
     def sous_total(self):
         return self.quantite * self.prix_unitaire
 
     def determine_prix(self):
         """Détermine le prix selon le type de vente"""
         if self.vente.type_vente == 'gros':
-            return self.produit.prix_gros, True
+            return self.produit.prix_vente_gros or self.produit.prix_vente or 0, True
         else:
-            return self.produit.prix_detail, False
+            return self.produit.prix_vente_detail or self.produit.prix_vente or 0, False
 
     def save(self, *args, **kwargs):
         # Si le prix n'est pas spécifié, le déterminer automatiquement
-        if not self.prix_unitaire:
+        if not self.prix_unitaire or self.prix_unitaire == 0:
             self.prix_unitaire, self.est_prix_gros = self.determine_prix()
 
-        super().save(*args, **kwargs)
+        # Calculer le montant total
+        self.montant_total = self.sous_total()
 
-    def sous_total(self):
-        return self.quantite * self.prix_unitaire
+        super().save(*args, **kwargs)
 
     def prelever_stock_entrepot(self):
         """Prélever le stock de l'entrepôt (confirmation de vente)"""
@@ -786,7 +811,7 @@ class LigneDeVente(models.Model):
             )
 
     def __str__(self):
-        return f"{self.produit.nom} x{self.quantite} ({self.entrepot.nom})"
+        return f"{self.produit.nom} x{self.quantite} ({self.entrepot.nom}) - {self.sous_total()}"
 
 
 class TransfertEntrepot(models.Model):
@@ -851,6 +876,9 @@ class TransfertEntrepot(models.Model):
                 self.confirme_at = timezone.now()
                 self.save()
 
+    def __str__(self):
+        return f"Transfert {self.reference} - {self.get_statut_display()}"
+
 
 class LigneTransfert(models.Model):
     transfert = models.ForeignKey(
@@ -858,6 +886,9 @@ class LigneTransfert(models.Model):
     )
     produit = models.ForeignKey(Produit, on_delete=models.CASCADE)
     quantite = models.IntegerField()
+
+    class Meta:
+        ordering = ['id']
 
     def __str__(self):
         return f"{self.produit.nom} x{self.quantite}"
@@ -872,6 +903,9 @@ class AuditLog(models.Model):
         ('mouvement_stock', 'Mouvement de stock'),
         ('connexion', 'Connexion'),
         ('deconnexion', 'Déconnexion'),
+        ('confirmation', 'Confirmation'),
+        ('annulation', 'Annulation'),
+        ('paiement', 'Paiement'),
     )
 
     user = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True)
@@ -880,6 +914,13 @@ class AuditLog(models.Model):
     objet_id = models.IntegerField(null=True, blank=True)
     details = models.JSONField(default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['action', 'created_at']),
+            models.Index(fields=['modele', 'objet_id']),
+        ]
 
     def __str__(self):
         return f"{self.user} - {self.action} - {self.modele} #{self.objet_id}"
@@ -898,6 +939,7 @@ def log_produit_save(sender, instance, created, **kwargs):
             'nom': instance.nom,
             'code': instance.code,
             'prix_vente': str(instance.prix_vente),
+            'prix_achat': str(instance.prix_achat),
         }
     )
 
@@ -913,7 +955,8 @@ def log_vente(sender, instance, created, **kwargs):
             details={
                 'numero_vente': instance.numero_vente,
                 'client': instance.client.nom if instance.client else 'Aucun',
-                'statut': instance.statut
+                'statut': instance.statut,
+                'montant_total': str(instance.montant_total)
             }
         )
 
@@ -930,6 +973,8 @@ def log_mouvement_stock(sender, instance, created, **kwargs):
                 'produit': instance.produit.nom,
                 'type': instance.type_mouvement,
                 'quantite': instance.quantite,
+                'source': instance.source,
+                'entrepot': instance.entrepot.nom if instance.entrepot else None,
             }
         )
 
@@ -945,6 +990,7 @@ def log_client_save(sender, instance, created, **kwargs):
         details={
             'nom': instance.nom,
             'type_client': instance.type_client,
+            'telephone': instance.telephone,
         }
     )
 
@@ -1052,33 +1098,100 @@ def liberer_stock_sur_suppression_vente(sender, instance, **kwargs):
     """
     Libérer le stock réservé quand une vente est supprimée (avant confirmation)
     """
-    if instance.statut == 'brouillon':
-        try:
-            with transaction.atomic():
-                for ligne in instance.lignes_vente.all():
-                    try:
-                        stock_entrepot = StockEntrepot.objects.get(
-                            entrepot=ligne.entrepot,
-                            produit=ligne.produit
-                        )
-                        # Libérer le stock réservé
+    try:
+        with transaction.atomic():
+            stocks_libérés = []
+
+            # Seulement pour les ventes en brouillon (stock réservé mais non prélevé)
+            for ligne in instance.lignes_vente.all():
+                try:
+                    stock_entrepot = StockEntrepot.objects.get(
+                        entrepot=ligne.entrepot,
+                        produit=ligne.produit
+                    )
+
+                    # Vérifier si le stock n'a pas encore été prélevé
+                    if not ligne.stock_preleve:
+                        ancienne_reserve = stock_entrepot.quantite_reservee
+
+                        # S'assurer qu'on ne libère pas plus que ce qui est réservé
                         if ligne.quantite <= stock_entrepot.quantite_reservee:
                             stock_entrepot.quantite_reservee -= ligne.quantite
                         else:
-                            # En cas d'erreur, libérer tout ce qui est réservé
+                            # Si anomalie, mettre à zéro
                             stock_entrepot.quantite_reservee = 0
 
                         stock_entrepot.save()
 
+                        stocks_libérés.append({
+                            'produit': ligne.produit.nom,
+                            'entrepot': ligne.entrepot.nom,
+                            'quantite': ligne.quantite,
+                            'ancienne_reserve': ancienne_reserve,
+                            'nouvelle_reserve': stock_entrepot.quantite_reservee
+                        })
+
                         print(
                             f"✅ Stock libéré: {ligne.produit.nom} - {ligne.quantite} unités")
 
-                    except StockEntrepot.DoesNotExist:
-                        print(f"⚠️ Stock non trouvé pour {ligne.produit.nom}")
-                        continue
+                except StockEntrepot.DoesNotExist:
+                    print(f"⚠️ Stock non trouvé pour {ligne.produit.nom}")
+                    continue
 
-        except Exception as e:
-            print(f"❌ Erreur lors de la libération du stock: {e}")
+            # Créer un log d'audit
+            AuditLog.objects.create(
+                user=instance.created_by if instance.created_by else None,
+                action='suppression',
+                modele='Vente',
+                objet_id=instance.id,
+                details={
+                    'numero_vente': instance.numero_vente,
+                    'statut': instance.statut,
+                    'stocks_libérés': stocks_libérés,
+                    'montant_total': str(instance.montant_total)
+                }
+            )
+
+    except Exception as e:
+        print(f"❌ Erreur lors de la libération du stock: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+# Signal pour libérer le stock lors de la suppression d'une ligne de vente
+@receiver(pre_delete, sender=LigneDeVente)
+def liberer_stock_sur_suppression_ligne_vente(sender, instance, **kwargs):
+    """
+    Libérer le stock réservé quand une ligne de vente est supprimée
+    (si la vente est en brouillon et le stock n'a pas été prélevé)
+    """
+    try:
+        # Vérifier que la vente est en brouillon et que le stock n'a pas été prélevé
+        if instance.vente.statut == 'brouillon' and not instance.stock_preleve:
+            with transaction.atomic():
+                try:
+                    stock_entrepot = StockEntrepot.objects.get(
+                        entrepot=instance.entrepot,
+                        produit=instance.produit
+                    )
+
+                    # Libérer le stock réservé
+                    ancienne_reserve = stock_entrepot.quantite_reservee
+                    if instance.quantite <= stock_entrepot.quantite_reservee:
+                        stock_entrepot.quantite_reservee -= instance.quantite
+                    else:
+                        stock_entrepot.quantite_reservee = 0
+
+                    stock_entrepot.save()
+
+                    print(
+                        f"✅ Stock libéré (ligne suppression): {instance.produit.nom} - {instance.quantite} unités")
+
+                except StockEntrepot.DoesNotExist:
+                    print(f"⚠️ Stock non trouvé pour {instance.produit.nom}")
+
+    except Exception as e:
+        print(f"❌ Erreur lors de la libération du stock (ligne): {e}")
 
 
 @receiver(reset_password_token_created)
