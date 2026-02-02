@@ -1,3 +1,4 @@
+from django.db.models import Sum, Q
 from rest_framework import viewsets, status, permissions
 from rest_framework.response import Response
 from rest_framework.decorators import action
@@ -536,13 +537,34 @@ class TransfertEntrepotViewSet(viewsets.ModelViewSet):
             )
 
 
+class IsAdmin(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return request.user.is_authenticated and request.user.role == 'admin'
+
+
+class IsAdminOrVendeur(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return request.user.is_authenticated and request.user.role in ['admin', 'vendeur']
+
+
 class VenteViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet pour gérer les ventes
+    """
     serializer_class = VenteDetailSerializer
     permission_classes = [IsAdminOrVendeur]
 
     def get_queryset(self):
+        """
+        Retourne le queryset des ventes selon le rôle de l'utilisateur
+        """
         user = self.request.user
         queryset = Vente.objects.all().order_by('-created_at')
+
+        # Filtres de recherche
+        statut = self.request.query_params.get('statut')
+        if statut:
+            queryset = queryset.filter(statut=statut)
 
         statut_paiement = self.request.query_params.get('statut_paiement')
         if statut_paiement:
@@ -552,48 +574,289 @@ class VenteViewSet(viewsets.ModelViewSet):
         if client_id:
             queryset = queryset.filter(client_id=client_id)
 
+        type_vente = self.request.query_params.get('type_vente')
+        if type_vente:
+            queryset = queryset.filter(type_vente=type_vente)
+
+        date_debut = self.request.query_params.get('date_debut')
+        date_fin = self.request.query_params.get('date_fin')
+        if date_debut and date_fin:
+            queryset = queryset.filter(
+                created_at__date__gte=date_debut,
+                created_at__date__lte=date_fin
+            )
+
         en_retard = self.request.query_params.get('en_retard')
-        if en_retard:
+        if en_retard and en_retard.lower() == 'true':
             queryset = queryset.filter(
                 date_echeance__lt=timezone.now().date(),
                 statut_paiement__in=['non_paye', 'partiel']
             )
 
+        # Filtre par utilisateur si pas admin
         if user.role != 'admin':
             queryset = queryset.filter(created_by=user)
 
         return queryset
 
     def get_serializer_class(self):
+        """
+        Retourne le serializer approprié selon l'action
+        """
         if self.action == 'create':
             return VenteCreateSerializer
         elif self.action in ['update', 'partial_update']:
             return VenteUpdateSerializer
         elif self.action == 'enregistrer_paiement':
             return EnregistrerPaiementSerializer
-        return VenteDetailSerializer
+        elif self.action in ['list', 'retrieve']:
+            return VenteDetailSerializer
+        return VenteSerializer
 
-    @action(detail=True, methods=['post'])
-    def confirmer(self, request, pk=None):
+    def get_serializer_context(self):
+        """
+        Ajoute le contexte pour les serializers
+        """
+        context = super().get_serializer_context()
+        context['request'] = self.request
+        return context
+
+    def perform_create(self, serializer):
+        """
+        Ajoute automatiquement created_by à la création
+        """
+        serializer.save(created_by=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        """
+        Création d'une vente avec gestion de transaction
+        """
+        try:
+            with transaction.atomic():
+                # Vérifier que l'utilisateur a les permissions
+                if not request.user.is_authenticated:
+                    return Response(
+                        {"error": "Authentication required"},
+                        status=status.HTTP_401_UNAUTHORIZED
+                    )
+
+                # Valider les données
+                serializer = self.get_serializer(data=request.data)
+                serializer.is_valid(raise_exception=True)
+
+                # Créer la vente
+                self.perform_create(serializer)
+
+                # Récupérer l'instance créée
+                vente = serializer.instance
+
+                # Mettre à jour les en-têtes de réponse
+                headers = self.get_success_headers(serializer.data)
+
+                # Retourner la réponse avec les données détaillées
+                response_serializer = VenteDetailSerializer(vente)
+                return Response(
+                    response_serializer.data,
+                    status=status.HTTP_201_CREATED,
+                    headers=headers
+                )
+
+        except serializers.ValidationError as e:
+            return Response(
+                {"error": e.detail},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {"error": f"Erreur interne: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    def update(self, request, *args, **kwargs):
+        """
+        Mise à jour d'une vente
+        """
+        try:
+            with transaction.atomic():
+                instance = self.get_object()
+
+                # Vérifier les permissions
+                if request.user.role != 'admin' and instance.created_by != request.user:
+                    return Response(
+                        {"error": "Vous ne pouvez modifier que vos propres ventes"},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+
+                # Vérifier que la vente n'est pas confirmée
+                if instance.statut == 'confirmee':
+                    return Response(
+                        {"error": "Impossible de modifier une vente confirmée"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                serializer = self.get_serializer(
+                    instance,
+                    data=request.data,
+                    partial=kwargs.get('partial', False)
+                )
+                serializer.is_valid(raise_exception=True)
+                self.perform_update(serializer)
+
+                return Response(serializer.data)
+
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+    def destroy(self, request, *args, **kwargs):
+        """
+        Suppression d'une vente avec libération du stock
+        """
         try:
             with transaction.atomic():
                 vente = self.get_object()
 
+                # Vérifier les permissions
+                if request.user.role != 'admin' and vente.created_by != request.user:
+                    return Response(
+                        {"error": "Vous ne pouvez supprimer que vos propres ventes"},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+
+                # Vérifier que la vente est en brouillon
+                if vente.statut != 'brouillon':
+                    return Response(
+                        {"error": "Seules les ventes en brouillon peuvent être supprimées"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # Libérer le stock réservé
+                stocks_liberes = []
+                for ligne in vente.lignes_vente.all():
+                    try:
+                        stock_entrepot = StockEntrepot.objects.get(
+                            entrepot=ligne.entrepot,
+                            produit=ligne.produit
+                        )
+
+                        ancienne_reserve = stock_entrepot.quantite_reservee
+                        nouvelle_reserve = max(
+                            0, ancienne_reserve - ligne.quantite)
+                        stock_entrepot.quantite_reservee = nouvelle_reserve
+                        stock_entrepot.save()
+
+                        stocks_liberes.append({
+                            'produit': ligne.produit.nom,
+                            'entrepot': ligne.entrepot.nom,
+                            'quantite': ligne.quantite
+                        })
+
+                    except StockEntrepot.DoesNotExist:
+                        continue
+
+                # Créer un log avant suppression
+                AuditLog.objects.create(
+                    user=request.user,
+                    action='suppression',
+                    modele='Vente',
+                    objet_id=vente.id,
+                    details={
+                        'numero_vente': vente.numero_vente,
+                        'montant_total': str(vente.montant_total),
+                        'stocks_liberes': stocks_liberes
+                    }
+                )
+
+                # Supprimer la vente
+                vente.delete()
+
+                return Response({
+                    'message': 'Vente supprimée avec succès',
+                    'stocks_liberes': stocks_liberes
+                }, status=status.HTTP_200_OK)
+
+        except Vente.DoesNotExist:
+            return Response(
+                {"error": "Vente non trouvée"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+    @action(detail=True, methods=['post'])
+    def confirmer(self, request, pk=None):
+        """
+        Confirmer une vente (passer de brouillon à confirmée)
+        """
+        try:
+            with transaction.atomic():
+                vente = self.get_object()
+
+                # Vérifier les permissions
+                if request.user.role != 'admin' and vente.created_by != request.user:
+                    return Response(
+                        {"error": "Vous ne pouvez confirmer que vos propres ventes"},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+
+                # Vérifier que la vente est en brouillon
                 if vente.statut != 'brouillon':
                     return Response(
                         {"error": "Seules les ventes en brouillon peuvent être confirmées"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
+                # Vérifier qu'il y a des lignes de vente
                 if not vente.lignes_vente.exists():
                     return Response(
                         {"error": "La vente ne contient aucun produit"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                vente.confirmer_vente()
+                # Vérifier le stock disponible
+                for ligne in vente.lignes_vente.all():
+                    try:
+                        stock_entrepot = StockEntrepot.objects.get(
+                            produit=ligne.produit,
+                            entrepot=ligne.entrepot
+                        )
 
-                vente.refresh_from_db()
+                        disponible = stock_entrepot.quantite_disponible
+                        if ligne.quantite > disponible:
+                            return Response(
+                                {"error": f"Stock insuffisant pour {ligne.produit.nom} dans {ligne.entrepot.nom}"},
+                                status=status.HTTP_400_BAD_REQUEST
+                            )
+
+                    except StockEntrepot.DoesNotExist:
+                        return Response(
+                            {"error": f"Le produit {ligne.produit.nom} n'est pas disponible dans {ligne.entrepot.nom}"},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                # Confirmer la vente
+                vente.statut = 'confirmee'
+                vente.date_confirmation = timezone.now()
+                vente.confirmed_by = request.user
+                vente.save()
+
+                # Créer un log d'audit
+                AuditLog.objects.create(
+                    user=request.user,
+                    action='confirmation',
+                    modele='Vente',
+                    objet_id=vente.id,
+                    details={
+                        'numero_vente': vente.numero_vente,
+                        'montant_total': str(vente.montant_total),
+                        'statut_paiement': vente.statut_paiement
+                    }
+                )
 
                 return Response({
                     "message": "Vente confirmée avec succès",
@@ -601,172 +864,194 @@ class VenteViewSet(viewsets.ModelViewSet):
                 }, status=status.HTTP_200_OK)
 
         except Vente.DoesNotExist:
-            return Response({"error": "Vente non trouvée"}, status=status.HTTP_404_NOT_FOUND)
-        except ValueError as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Vente non trouvée"},
+                status=status.HTTP_404_NOT_FOUND
+            )
         except Exception as e:
-            return Response({"error": f"Erreur interne: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response(
+                {"error": f"Erreur interne: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     @action(detail=True, methods=['post'])
     def annuler(self, request, pk=None):
+        """
+        Annuler une vente
+        """
         try:
             with transaction.atomic():
                 vente = self.get_object()
 
+                # Vérifier les permissions
+                if request.user.role != 'admin' and vente.created_by != request.user:
+                    return Response(
+                        {"error": "Vous ne pouvez annuler que vos propres ventes"},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+
+                # Vérifier que la vente est en brouillon
                 if vente.statut != 'brouillon':
                     return Response(
                         {"error": "Seules les ventes en brouillon peuvent être annulées"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                stocks_libérés = []
+                # Libérer le stock réservé
+                stocks_liberes = []
                 for ligne in vente.lignes_vente.all():
                     try:
                         stock_entrepot = StockEntrepot.objects.get(
                             produit=ligne.produit,
                             entrepot=ligne.entrepot
                         )
-                        stock_entrepot.liberer_stock(ligne.quantite)
-                        stocks_libérés.append({
+
+                        stock_entrepot.quantite_reservee = max(
+                            0, stock_entrepot.quantite_reservee - ligne.quantite
+                        )
+                        stock_entrepot.save()
+
+                        stocks_liberes.append({
                             'produit': ligne.produit.nom,
                             'entrepot': ligne.entrepot.nom,
                             'quantite': ligne.quantite
                         })
+
                     except StockEntrepot.DoesNotExist:
                         continue
 
+                # Annuler la vente
                 vente.statut = 'annulee'
+                vente.date_annulation = timezone.now()
+                vente.annule_par = request.user
                 vente.save()
 
-                vente.refresh_from_db()
+                # Créer un log d'audit
+                AuditLog.objects.create(
+                    user=request.user,
+                    action='annulation',
+                    modele='Vente',
+                    objet_id=vente.id,
+                    details={
+                        'numero_vente': vente.numero_vente,
+                        'stocks_liberes': stocks_liberes
+                    }
+                )
 
                 return Response({
                     "message": "Vente annulée avec succès",
-                    "stocks_libérés": stocks_libérés,
+                    "stocks_liberes": stocks_liberes,
                     "vente": VenteDetailSerializer(vente).data
                 }, status=status.HTTP_200_OK)
 
         except Vente.DoesNotExist:
-            return Response({"error": "Vente non trouvée"}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"error": "Vente non trouvée"},
+                status=status.HTTP_404_NOT_FOUND
+            )
         except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     @action(detail=True, methods=['post'])
     def enregistrer_paiement(self, request, pk=None):
+        """
+        Enregistrer un paiement pour une vente
+        """
         try:
             with transaction.atomic():
                 vente = self.get_object()
 
+                # Vérifier que la vente est confirmée
                 if vente.statut != 'confirmee':
                     return Response(
                         {"error": "Seules les ventes confirmées peuvent recevoir des paiements"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
+                # Vérifier que la vente n'est pas déjà entièrement payée
                 if vente.statut_paiement == 'paye':
                     return Response(
                         {"error": "Cette vente est déjà entièrement payée"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
+                # Valider les données du paiement
                 serializer = EnregistrerPaiementSerializer(
                     data=request.data,
                     context={'vente': vente}
                 )
+                serializer.is_valid(raise_exception=True)
+                data = serializer.validated_data
 
-                if serializer.is_valid():
-                    data = serializer.validated_data
+                # Créer le paiement
+                paiement = Paiement.objects.create(
+                    vente=vente,
+                    montant=data['montant'],
+                    mode_paiement=data['mode_paiement'],
+                    reference=data.get('reference', ''),
+                    notes=data.get('notes', ''),
+                    created_by=request.user
+                )
 
-                    paiement = Paiement.objects.create(
-                        vente=vente,
-                        montant=data['montant'],
-                        mode_paiement=data['mode_paiement'],
-                        reference=data.get('reference', ''),
-                        notes=data.get('notes', ''),
-                        created_by=request.user
-                    )
+                # Mettre à jour les informations de la vente
+                vente.montant_paye += data['montant']
+                vente.montant_restant = max(
+                    0, vente.montant_total - vente.montant_paye)
 
-                    vente.montant_paye += data['montant']
+                # Mettre à jour le statut de paiement
+                if vente.montant_paye >= vente.montant_total:
+                    vente.statut_paiement = 'paye'
+                elif vente.montant_paye > 0:
+                    vente.statut_paiement = 'partiel'
+                else:
+                    vente.statut_paiement = 'non_paye'
 
-                    if not vente.mode_paiement:
-                        vente.mode_paiement = data['mode_paiement']
+                # Mettre à jour le mode de paiement si nécessaire
+                if not vente.mode_paiement:
+                    vente.mode_paiement = data['mode_paiement']
 
-                    vente.update_statut_paiement()
+                vente.save()
 
-                    AuditLog.objects.create(
-                        user=request.user,
-                        action='vente',
-                        modele='Paiement',
-                        objet_id=paiement.id,
-                        details={
-                            'vente': vente.numero_vente,
-                            'montant': str(data['montant']),
-                            'mode_paiement': data['mode_paiement'],
-                            'nouveau_statut': vente.statut_paiement
-                        }
-                    )
-
-                    return Response({
-                        'message': 'Paiement enregistré avec succès',
-                        'paiement': PaiementSerializer(paiement).data,
-                        'vente': VenteDetailSerializer(vente).data
-                    }, status=status.HTTP_200_OK)
-
-                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        except Vente.DoesNotExist:
-            return Response({'error': 'Vente non trouvée'}, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-    def destroy(self, request, pk=None):
-        """Surcharger la suppression pour libérer le stock réservé"""
-        try:
-            with transaction.atomic():
-                vente = self.get_object()
-
-                # Libérer le stock réservé si la vente est en brouillon
-                if vente.statut == 'brouillon':
-                    stocks_libérés = []
-                    for ligne in vente.lignes_vente.all():
-                        try:
-                            stock_entrepot = StockEntrepot.objects.get(
-                                entrepot=ligne.entrepot,
-                                produit=ligne.produit
-                            )
-
-                            ancienne_reserve = stock_entrepot.quantite_reservee
-                            nouvelle_reserve = max(
-                                0, ancienne_reserve - ligne.quantite)
-                            stock_entrepot.quantite_reservee = nouvelle_reserve
-                            stock_entrepot.save()
-
-                            stocks_libérés.append({
-                                'produit': ligne.produit.nom,
-                                'entrepot': ligne.entrepot.nom,
-                                'quantite': ligne.quantite,
-                                'ancienne_reserve': ancienne_reserve,
-                                'nouvelle_reserve': nouvelle_reserve
-                            })
-
-                        except StockEntrepot.DoesNotExist:
-                            continue
-
-                # Supprimer la vente
-                vente.delete()
+                # Créer un log d'audit
+                AuditLog.objects.create(
+                    user=request.user,
+                    action='paiement',
+                    modele='Vente',
+                    objet_id=vente.id,
+                    details={
+                        'numero_vente': vente.numero_vente,
+                        'montant_paye': str(data['montant']),
+                        'mode_paiement': data['mode_paiement'],
+                        'nouveau_statut': vente.statut_paiement,
+                        'paiement_id': paiement.id
+                    }
+                )
 
                 return Response({
-                    'message': 'Vente supprimée avec succès',
-                    'stocks_libérés': stocks_libérés
+                    'message': 'Paiement enregistré avec succès',
+                    'paiement': PaiementSerializer(paiement).data,
+                    'vente': VenteDetailSerializer(vente).data
                 }, status=status.HTTP_200_OK)
 
         except Vente.DoesNotExist:
-            return Response({'error': 'Vente non trouvée'}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {'error': 'Vente non trouvée'},
+                status=status.HTTP_404_NOT_FOUND
+            )
         except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     @action(detail=False, methods=['get'])
     def statistiques(self, request):
+        """
+        Statistiques générales sur les ventes
+        """
         user = request.user
         queryset = self.get_queryset()
 
@@ -797,27 +1082,19 @@ class VenteViewSet(viewsets.ModelViewSet):
             'ventes_confirmees': ventes_confirmees,
             'ventes_brouillon': ventes_brouillon,
             'ventes_annulees': ventes_annulees,
-            'chiffre_affaires': chiffre_affaires,
-            'montant_a_recouvrer': montant_a_recouvrer,
+            'chiffre_affaires': float(chiffre_affaires),
+            'montant_a_recouvrer': float(montant_a_recouvrer),
             'ventes_en_retard': ventes_en_retard,
             'taux_confirmation': (ventes_confirmees / total_ventes * 100) if total_ventes > 0 else 0,
             'taux_paiement': ((chiffre_affaires - montant_a_recouvrer) / chiffre_affaires * 100)
             if chiffre_affaires > 0 else 0
         })
 
-    def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
-
-    def create(self, request, *args, **kwargs):
-        try:
-            with transaction.atomic():
-                return super().create(request, *args, **kwargs)
-        except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
     @action(detail=False, methods=['get'])
     def ventes_impayees(self, request):
-        """Liste des ventes impayées ou partiellement payées"""
+        """
+        Liste des ventes impayées ou partiellement payées
+        """
         queryset = self.get_queryset().filter(
             statut='confirmee',
             statut_paiement__in=['non_paye', 'partiel']
@@ -833,7 +1110,9 @@ class VenteViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def ventes_en_retard(self, request):
-        """Liste des ventes en retard de paiement"""
+        """
+        Liste des ventes en retard de paiement
+        """
         queryset = self.get_queryset().filter(
             statut='confirmee',
             statut_paiement__in=['non_paye', 'partiel', 'retard'],
@@ -844,11 +1123,159 @@ class VenteViewSet(viewsets.ModelViewSet):
         result = []
         for vente in queryset:
             data = VenteDetailSerializer(vente).data
-            data['jours_retard'] = vente.jours_retard(
-            ) if hasattr(vente, 'jours_retard') else 0
+            if hasattr(vente, 'jours_retard'):
+                data['jours_retard'] = vente.jours_retard()
+            elif hasattr(vente, 'date_echeance') and vente.date_echeance:
+                data['jours_retard'] = (
+                    timezone.now().date() - vente.date_echeance).days
+            else:
+                data['jours_retard'] = 0
             result.append(data)
 
         return Response(result)
+
+    @action(detail=True, methods=['get'])
+    def paiements(self, request, pk=None):
+        """
+        Liste des paiements d'une vente
+        """
+        try:
+            vente = self.get_object()
+            paiements = vente.paiements.all().order_by('-date_paiement')
+
+            serializer = PaiementSerializer(paiements, many=True)
+            return Response({
+                'vente': VenteDetailSerializer(vente).data,
+                'paiements': serializer.data,
+                'total_paye': vente.montant_paye,
+                'montant_restant': vente.montant_restant
+            })
+
+        except Vente.DoesNotExist:
+            return Response(
+                {"error": "Vente non trouvée"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+    @action(detail=False, methods=['get'])
+    def ventes_du_jour(self, request):
+        """
+        Liste des ventes créées aujourd'hui
+        """
+        aujourd_hui = timezone.now().date()
+        queryset = self.get_queryset().filter(
+            created_at__date=aujourd_hui
+        ).order_by('-created_at')
+
+        total_ventes = queryset.count()
+        total_montant = queryset.aggregate(
+            total=Sum('montant_total'))['total'] or 0
+
+        serializer = VenteSerializer(queryset, many=True)
+
+        return Response({
+            'date': aujourd_hui.strftime('%d/%m/%Y'),
+            'total_ventes': total_ventes,
+            'total_montant': float(total_montant),
+            'ventes': serializer.data
+        })
+
+    @action(detail=False, methods=['get'])
+    def ventes_du_mois(self, request):
+        """
+        Statistiques des ventes du mois en cours
+        """
+        debut_mois = timezone.now().replace(day=1).date()
+        aujourd_hui = timezone.now().date()
+
+        queryset = self.get_queryset().filter(
+            created_at__date__gte=debut_mois,
+            created_at__date__lte=aujourd_hui
+        )
+
+        total_ventes = queryset.count()
+        ventes_confirmees = queryset.filter(statut='confirmee').count()
+        total_montant = queryset.filter(statut='confirmee').aggregate(
+            total=Sum('montant_total')
+        )['total'] or 0
+
+        # Ventilation par jour
+        jours = {}
+        current_date = debut_mois
+        while current_date <= aujourd_hui:
+            jours[current_date.strftime('%Y-%m-%d')] = {
+                'date': current_date.strftime('%d/%m'),
+                'ventes': 0,
+                'montant': 0
+            }
+            current_date += timedelta(days=1)
+
+        ventes_par_jour = queryset.filter(statut='confirmee').values(
+            'created_at__date'
+        ).annotate(
+            count=Count('id'),
+            total=Sum('montant_total')
+        ).order_by('created_at__date')
+
+        for jour in ventes_par_jour:
+            date_str = jour['created_at__date'].strftime('%Y-%m-%d')
+            if date_str in jours:
+                jours[date_str]['ventes'] = jour['count']
+                jours[date_str]['montant'] = float(jour['total'] or 0)
+
+        return Response({
+            'periode': {
+                'debut': debut_mois.strftime('%d/%m/%Y'),
+                'fin': aujourd_hui.strftime('%d/%m/%Y')
+            },
+            'statistiques': {
+                'total_ventes': total_ventes,
+                'ventes_confirmees': ventes_confirmees,
+                'chiffre_affaires': float(total_montant)
+            },
+            'evolution': list(jours.values())
+        })
+
+    @action(detail=False, methods=['get'])
+    def export_csv(self, request):
+        """
+        Exporter les ventes en CSV (version simplifiée)
+        """
+        from django.http import HttpResponse
+        import csv
+
+        queryset = self.get_queryset()
+
+        # Créer la réponse HTTP avec le type CSV
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="ventes.csv"'
+
+        writer = csv.writer(response)
+
+        # Écrire l'en-tête
+        writer.writerow([
+            'Numéro', 'Date', 'Client', 'Type', 'Statut',
+            'Montant Total', 'Montant Payé', 'Montant Restant',
+            'Statut Paiement', 'Mode Paiement', 'Vendeur'
+        ])
+
+        # Écrire les données
+        for vente in queryset:
+            writer.writerow([
+                vente.numero_vente,
+                vente.created_at.strftime('%d/%m/%Y %H:%M'),
+                vente.client.nom if vente.client else '',
+                vente.get_type_vente_display(),
+                vente.get_statut_display(),
+                str(vente.montant_total),
+                str(vente.montant_paye),
+                str(vente.montant_restant),
+                vente.get_statut_paiement_display(),
+                vente.get_mode_paiement_display() if vente.mode_paiement else '',
+                vente.created_by.email if vente.created_by else ''
+            ])
+
+        return response
 
 
 class HistoriqueClientViewSet(viewsets.ViewSet):

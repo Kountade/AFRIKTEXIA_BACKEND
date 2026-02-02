@@ -1,3 +1,4 @@
+from django.db.models import Sum
 from rest_framework import serializers
 from .models import *
 from django.contrib.auth import get_user_model
@@ -230,7 +231,7 @@ class LigneDeVenteCreateSerializer(serializers.ModelSerializer):
             'produit': {'required': True},
             'entrepot': {'required': True},
             'quantite': {'required': True},
-            'prix_unitaire': {'required': True}
+
         }
 
 
@@ -239,6 +240,7 @@ class LigneDeVenteSerializer(serializers.ModelSerializer):
     produit_code = serializers.CharField(source='produit.code', read_only=True)
     entrepot_nom = serializers.CharField(source='entrepot.nom', read_only=True)
     sous_total = serializers.ReadOnlyField()
+    est_prix_gros = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = LigneDeVente
@@ -268,80 +270,225 @@ class VenteCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Vente
-        fields = ('client', 'remise', 'lignes_vente', 'mode_paiement',
+        fields = ('client', 'type_vente', 'remise', 'lignes_vente', 'mode_paiement',
                   'montant_paye', 'date_echeance', 'notes')
         read_only_fields = ('created_by', 'created_at', 'numero_vente')
         extra_kwargs = {
             'client': {'required': False, 'allow_null': True},
-            'remise': {'required': False, 'default': 0}
+            'remise': {'required': False, 'default': 0},
+            'type_vente': {'required': False, 'default': 'detail'}
         }
 
     def validate_lignes_vente(self, value):
-        # ... votre validation existante ...
+        if not value or len(value) == 0:
+            raise serializers.ValidationError(
+                "Au moins une ligne de vente est requise."
+            )
+
+        for ligne in value:
+            produit = ligne.get('produit')
+            entrepot = ligne.get('entrepot')
+            quantite = ligne.get('quantite')
+
+            if not produit or not entrepot or not quantite or quantite <= 0:
+                raise serializers.ValidationError(
+                    "Chaque ligne doit avoir un produit, un entrepôt et une quantité positive."
+                )
+
+            # Vérifier le stock disponible
+            try:
+                stock_entrepot = StockEntrepot.objects.get(
+                    produit=produit,
+                    entrepot=entrepot
+                )
+                disponible = stock_entrepot.quantite_disponible
+                if quantite > disponible:
+                    raise serializers.ValidationError(
+                        f"Stock insuffisant pour {produit.nom} dans {entrepot.nom}. Disponible: {disponible}"
+                    )
+            except StockEntrepot.DoesNotExist:
+                raise serializers.ValidationError(
+                    f"Le produit {produit.nom} n'est pas disponible dans {entrepot.nom}"
+                )
+
         return value
 
     @transaction.atomic
     def create(self, validated_data):
-        # NE PAS assigner created_by ici
-        # La vue le fera via perform_create()
-
         lignes_data = validated_data.pop('lignes_vente')
+        type_vente = validated_data.get('type_vente', 'detail')
 
-        # Générer numéro de vente unique
+        # Récupérer l'utilisateur du contexte
+        user = self.context.get(
+            'request').user if self.context.get('request') else None
+
+        # Générer numéro de vente
         today = datetime.now().strftime('%Y%m%d')
         last_vente_today = Vente.objects.filter(
             numero_vente__startswith=f'V{today}'
-        ).count()
-        numero_vente = f'V{today}{last_vente_today + 1:04d}'
+        ).order_by('-numero_vente').first()
 
-        # Créer la vente SANS created_by
+        if last_vente_today:
+            try:
+                last_number = int(last_vente_today.numero_vente[-4:])
+                new_number = last_number + 1
+            except (ValueError, IndexError):
+                new_number = 1
+        else:
+            new_number = 1
+
+        numero_vente = f'V{today}{new_number:04d}'
+
+        # Créer la vente avec tous les champs explicitement
         vente = Vente.objects.create(
             numero_vente=numero_vente,
-            **validated_data
-            # created_by sera ajouté par perform_create()
+            client=validated_data.get('client'),
+            type_vente=validated_data.get('type_vente', 'detail'),
+            remise=validated_data.get('remise', 0),
+            mode_paiement=validated_data.get('mode_paiement'),
+            montant_paye=validated_data.get('montant_paye', 0),
+            date_echeance=validated_data.get('date_echeance'),
+            notes=validated_data.get('notes', ''),
+            # created_by sera ajouté par perform_create() dans la vue
+            # Ne pas l'inclure ici
         )
 
-        # Créer les lignes de vente et réserver le stock
+        # Créer les lignes avec les prix adaptés selon le type de vente
         entrepots_utilises = set()
-        for ligne_data in lignes_data:
-            ligne = LigneDeVente.objects.create(vente=vente, **ligne_data)
-            entrepots_utilises.add(ligne.entrepot)
+        lignes_vente_crees = []
 
-            # Réserver le stock dans l'entrepôt
+        for ligne_data in lignes_data:
+            # Récupérer les données de la ligne
+            produit = ligne_data.get('produit')
+            entrepot = ligne_data.get('entrepot')
+            quantite = ligne_data.get('quantite')
+
+            # Validation des données obligatoires
+            if not produit or not entrepot or not quantite:
+                raise serializers.ValidationError({
+                    'lignes_vente': 'Données de ligne de vente incomplètes'
+                })
+
+            # Déterminer le prix selon type de vente
+            if type_vente == 'gros':
+                prix_unitaire = produit.prix_vente_gros or produit.prix_vente or 0
+                est_prix_gros = True
+            else:
+                prix_unitaire = produit.prix_vente_detail or produit.prix_vente or 0
+                est_prix_gros = False
+
+            # Vérifier que le prix unitaire est valide
+            if prix_unitaire <= 0:
+                raise serializers.ValidationError({
+                    'lignes_vente': f'Prix invalide pour le produit {produit.nom}'
+                })
+
+            # Créer la ligne de vente explicitement
+            ligne = LigneDeVente.objects.create(
+                vente=vente,
+                produit=produit,
+                entrepot=entrepot,
+                quantite=quantite,
+                prix_unitaire=prix_unitaire,
+                est_prix_gros=est_prix_gros
+            )
+
+            lignes_vente_crees.append(ligne)
+
+            # Réserver le stock
             try:
                 stock_entrepot = StockEntrepot.objects.get(
-                    produit=ligne.produit,
-                    entrepot=ligne.entrepot
+                    produit=produit,
+                    entrepot=entrepot
                 )
 
-                # Vérifier le stock disponible
                 disponible = stock_entrepot.quantite_disponible
-                if ligne.quantite > disponible:
+                if quantite > disponible:
                     raise serializers.ValidationError({
-                        'lignes_vente': f'Stock devenu insuffisant pour {ligne.produit.nom}'
+                        'lignes_vente': f'Stock devenu insuffisant pour {produit.nom} dans {entrepot.nom}. Disponible: {disponible}'
                     })
 
                 # Réserver le stock
-                stock_entrepot.reserver_stock(ligne.quantite)
+                stock_entrepot.quantite_reservee += quantite
+                stock_entrepot.save()
 
             except StockEntrepot.DoesNotExist:
                 raise serializers.ValidationError({
-                    'lignes_vente': f'Stock non trouvé pour {ligne.produit.nom}'
-                })
-            except ValueError as e:
-                raise serializers.ValidationError({
-                    'lignes_vente': str(e)
+                    'lignes_vente': f'Stock non trouvé pour {produit.nom} dans {entrepot.nom}'
                 })
 
-        # Ajouter les entrepôts utilisés à la vente
-        vente.entrepots.set(entrepots_utilises)
+            entrepots_utilises.add(entrepot)
 
-        # Calculer et sauvegarder le montant total
-        vente.montant_total = vente.calculer_total()
+        # Ajouter les entrepôts à la vente
+        if entrepots_utilises:
+            vente.entrepots.set(entrepots_utilises)
+
+        # Calculer le total
+        total = 0
+        for ligne in lignes_vente_crees:
+            ligne_total = ligne.prix_unitaire * ligne.quantite
+            total += ligne_total
+
+            # Optionnel: sauvegarder le total par ligne
+            ligne.montant_total = ligne_total
+            ligne.save()
+
+        # Appliquer la remise
+        remise = vente.remise or 0
+        if remise > 0 and remise <= 100:
+            montant_remise = total * remise / 100
+            total_apres_remise = total - montant_remise
+        else:
+            montant_remise = 0
+            total_apres_remise = total
+
+        vente.montant_total = total_apres_remise
+        vente.montant_avant_remise = total
+        vente.montant_remise = montant_remise
+
+        # Calculer le montant restant
+        montant_paye = vente.montant_paye or 0
+        montant_restant = max(0, total_apres_remise - montant_paye)
+
+        vente.montant_restant = montant_restant
+
+        # Déterminer le statut de paiement
+        if montant_paye >= total_apres_remise:
+            vente.statut_paiement = 'paye'
+        elif montant_paye > 0:
+            vente.statut_paiement = 'partiel'
+        else:
+            vente.statut_paiement = 'non_paye'
+
+        # Définir le statut initial
+        vente.statut = 'brouillon'
+
+        # Sauvegarder la vente
         vente.save()
 
-        # Audit - créé après que la vente existe
-        # (mais le user viendra de self.context['request'].user)
+        # Créer un log d'audit si l'utilisateur est disponible
+        if user:
+            try:
+                AuditLog.objects.create(
+                    user=user,
+                    action='creation',
+                    modele='Vente',
+                    objet_id=vente.id,
+                    details={
+                        'numero_vente': numero_vente,
+                        'montant_total': str(vente.montant_total),
+                        'montant_avant_remise': str(total),
+                        'remise': str(remise),
+                        'montant_remise': str(montant_remise),
+                        'type_vente': type_vente,
+                        'nombre_lignes': len(lignes_vente_crees),
+                        'entrepots': [e.nom for e in entrepots_utilises]
+                    }
+                )
+            except Exception as e:
+                # Ne pas bloquer la création si le log échoue
+                print(f"Erreur lors de la création du log d'audit: {e}")
+
         return vente
 
 

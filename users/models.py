@@ -92,8 +92,17 @@ class Produit(models.Model):
     description = models.TextField(blank=True)
     categorie = models.ForeignKey(
         Categorie, on_delete=models.SET_NULL, null=True)
+
+    # Prix d'achat (du fournisseur)
     prix_achat = models.DecimalField(max_digits=10, decimal_places=2)
-    prix_vente = models.DecimalField(max_digits=10, decimal_places=2)
+    prix_vente_gros = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0)
+    prix_vente_detail = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0)
+    # Garder pour compatibilité
+    prix_vente = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0)
+
     stock_alerte = models.IntegerField(default=5)
     fournisseur = models.ForeignKey(
         Fournisseur, on_delete=models.SET_NULL, null=True)
@@ -115,6 +124,14 @@ class Produit(models.Model):
 
     class Meta:
         ordering = ['-created_at']
+
+    def save(self, *args, **kwargs):
+        # Pour la compatibilité, remplir prix_vente si vide
+        if not self.prix_vente:
+            self.prix_vente = self.prix_vente_detail
+        super().save(*args, **kwargs)
+
+    # ... reste des méthodes existantes
 
     def stock_actuel(self):
         """Stock total dans tous les entrepôts"""
@@ -423,10 +440,30 @@ class Vente(models.Model):
         ('mobile_money', 'Mobile Money'),
     )
 
+    TYPE_VENTE = (
+        ('gros', 'Gros'),
+        ('detail', 'Détail'),
+    )
+
+    # ... [autres champs]
+
+    # Ajouter default dans le modèle aussi
+    type_vente = models.CharField(
+        max_length=10,
+        choices=TYPE_VENTE,
+        default='detail'  # ← default ici
+    )
+
     client = models.ForeignKey(
         Client, on_delete=models.SET_NULL, null=True, blank=True
     )
     numero_vente = models.CharField(max_length=50, unique=True)
+
+    # Nouveau champ: type de vente (gros ou détail)
+    type_vente = models.CharField(
+        max_length=10, choices=TYPE_VENTE, default='detail'
+    )
+
     statut = models.CharField(
         max_length=20, choices=STATUT_VENTE, default='brouillon'
     )
@@ -457,6 +494,8 @@ class Vente(models.Model):
 
     class Meta:
         ordering = ['-created_at']
+
+    # ... reste des méthodes
 
     def save(self, *args, **kwargs):
         # Calculer le montant restant
@@ -678,6 +717,26 @@ class LigneDeVente(models.Model):
     quantite = models.IntegerField()
     prix_unitaire = models.DecimalField(max_digits=10, decimal_places=2)
     stock_preleve = models.BooleanField(default=False)
+
+    # Nouveau: marquer si c'est un prix de gros ou détail
+    est_prix_gros = models.BooleanField(default=False)
+
+    def sous_total(self):
+        return self.quantite * self.prix_unitaire
+
+    def determine_prix(self):
+        """Détermine le prix selon le type de vente"""
+        if self.vente.type_vente == 'gros':
+            return self.produit.prix_gros, True
+        else:
+            return self.produit.prix_detail, False
+
+    def save(self, *args, **kwargs):
+        # Si le prix n'est pas spécifié, le déterminer automatiquement
+        if not self.prix_unitaire:
+            self.prix_unitaire, self.est_prix_gros = self.determine_prix()
+
+        super().save(*args, **kwargs)
 
     def sous_total(self):
         return self.quantite * self.prix_unitaire
