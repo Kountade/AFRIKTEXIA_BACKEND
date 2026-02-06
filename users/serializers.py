@@ -315,12 +315,17 @@ class VenteCreateSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
+        """Création simplifiée et robuste comme l'Application 2"""
         lignes_data = validated_data.pop('lignes_vente')
-        type_vente = validated_data.get('type_vente', 'detail')
 
-        # Récupérer l'utilisateur du contexte
+        # Récupérer l'utilisateur depuis le contexte
         user = self.context.get(
             'request').user if self.context.get('request') else None
+
+        if not user or not user.is_authenticated:
+            raise serializers.ValidationError({
+                'non_field_errors': 'Utilisateur non authentifié'
+            })
 
         # Générer numéro de vente
         today = datetime.now().strftime('%Y%m%d')
@@ -339,7 +344,7 @@ class VenteCreateSerializer(serializers.ModelSerializer):
 
         numero_vente = f'V{today}{new_number:04d}'
 
-        # Créer la vente avec tous les champs explicitement
+        # Créer la vente AVEC created_by
         vente = Vente.objects.create(
             numero_vente=numero_vente,
             client=validated_data.get('client'),
@@ -349,25 +354,18 @@ class VenteCreateSerializer(serializers.ModelSerializer):
             montant_paye=validated_data.get('montant_paye', 0),
             date_echeance=validated_data.get('date_echeance'),
             notes=validated_data.get('notes', ''),
-            # created_by sera ajouté par perform_create() dans la vue
-            # Ne pas l'inclure ici
+            created_by=user  # ⚠️ IMPORTANT: Ajouter created_by ici
         )
 
-        # Créer les lignes avec les prix adaptés selon le type de vente
+        # Créer les lignes de vente
         entrepots_utilises = set()
-        lignes_vente_crees = []
+        montant_total = 0
 
         for ligne_data in lignes_data:
-            # Récupérer les données de la ligne
             produit = ligne_data.get('produit')
             entrepot = ligne_data.get('entrepot')
             quantite = ligne_data.get('quantite')
-
-            # Validation des données obligatoires
-            if not produit or not entrepot or not quantite:
-                raise serializers.ValidationError({
-                    'lignes_vente': 'Données de ligne de vente incomplètes'
-                })
+            type_vente = validated_data.get('type_vente', 'detail')
 
             # Déterminer le prix selon type de vente
             if type_vente == 'gros':
@@ -377,13 +375,7 @@ class VenteCreateSerializer(serializers.ModelSerializer):
                 prix_unitaire = produit.prix_vente_detail or produit.prix_vente or 0
                 est_prix_gros = False
 
-            # Vérifier que le prix unitaire est valide
-            if prix_unitaire <= 0:
-                raise serializers.ValidationError({
-                    'lignes_vente': f'Prix invalide pour le produit {produit.nom}'
-                })
-
-            # Créer la ligne de vente explicitement
+            # Créer la ligne
             ligne = LigneDeVente.objects.create(
                 vente=vente,
                 produit=produit,
@@ -393,101 +385,74 @@ class VenteCreateSerializer(serializers.ModelSerializer):
                 est_prix_gros=est_prix_gros
             )
 
-            lignes_vente_crees.append(ligne)
+            # Calculer le sous-total
+            sous_total = quantite * prix_unitaire
+            ligne.montant_total = sous_total
+            ligne.save()
 
-            # Réserver le stock
+            montant_total += sous_total
+            entrepots_utilises.add(entrepot)
+
+            # Réserver le stock (version simplifiée)
             try:
                 stock_entrepot = StockEntrepot.objects.get(
                     produit=produit,
                     entrepot=entrepot
                 )
 
-                disponible = stock_entrepot.quantite_disponible
-                if quantite > disponible:
-                    raise serializers.ValidationError({
-                        'lignes_vente': f'Stock devenu insuffisant pour {produit.nom} dans {entrepot.nom}. Disponible: {disponible}'
-                    })
-
-                # Réserver le stock
-                stock_entrepot.quantite_reservee += quantite
-                stock_entrepot.save()
+                # Utiliser la méthode reserver_stock() du modèle
+                stock_entrepot.reserver_stock(quantite)
 
             except StockEntrepot.DoesNotExist:
                 raise serializers.ValidationError({
                     'lignes_vente': f'Stock non trouvé pour {produit.nom} dans {entrepot.nom}'
                 })
 
-            entrepots_utilises.add(entrepot)
-
         # Ajouter les entrepôts à la vente
-        if entrepots_utilises:
-            vente.entrepots.set(entrepots_utilises)
-
-        # Calculer le total
-        total = 0
-        for ligne in lignes_vente_crees:
-            ligne_total = ligne.prix_unitaire * ligne.quantite
-            total += ligne_total
-
-            # Optionnel: sauvegarder le total par ligne
-            ligne.montant_total = ligne_total
-            ligne.save()
+        vente.entrepots.set(entrepots_utilises)
 
         # Appliquer la remise
-        remise = vente.remise or 0
+        remise = validated_data.get('remise', 0)
         if remise > 0 and remise <= 100:
-            montant_remise = total * remise / 100
-            total_apres_remise = total - montant_remise
+            montant_remise = montant_total * remise / 100
+            montant_total_apres_remise = montant_total - montant_remise
         else:
             montant_remise = 0
-            total_apres_remise = total
+            montant_total_apres_remise = montant_total
 
-        vente.montant_total = total_apres_remise
-        vente.montant_avant_remise = total
+        # Mettre à jour la vente
+        vente.montant_total = montant_total_apres_remise
+        vente.montant_avant_remise = montant_total
         vente.montant_remise = montant_remise
+        vente.montant_restant = max(
+            0, montant_total_apres_remise - vente.montant_paye)
 
-        # Calculer le montant restant
-        montant_paye = vente.montant_paye or 0
-        montant_restant = max(0, total_apres_remise - montant_paye)
-
-        vente.montant_restant = montant_restant
-
-        # Déterminer le statut de paiement
-        if montant_paye >= total_apres_remise:
+        # Déterminer statut paiement
+        if vente.montant_paye >= montant_total_apres_remise:
             vente.statut_paiement = 'paye'
-        elif montant_paye > 0:
+        elif vente.montant_paye > 0:
             vente.statut_paiement = 'partiel'
         else:
             vente.statut_paiement = 'non_paye'
 
-        # Définir le statut initial
-        vente.statut = 'brouillon'
-
-        # Sauvegarder la vente
         vente.save()
 
-        # Créer un log d'audit si l'utilisateur est disponible
-        if user:
-            try:
-                AuditLog.objects.create(
-                    user=user,
-                    action='creation',
-                    modele='Vente',
-                    objet_id=vente.id,
-                    details={
-                        'numero_vente': numero_vente,
-                        'montant_total': str(vente.montant_total),
-                        'montant_avant_remise': str(total),
-                        'remise': str(remise),
-                        'montant_remise': str(montant_remise),
-                        'type_vente': type_vente,
-                        'nombre_lignes': len(lignes_vente_crees),
-                        'entrepots': [e.nom for e in entrepots_utilises]
-                    }
-                )
-            except Exception as e:
-                # Ne pas bloquer la création si le log échoue
-                print(f"Erreur lors de la création du log d'audit: {e}")
+        # Audit log
+        try:
+            AuditLog.objects.create(
+                user=user,
+                action='creation',
+                modele='Vente',
+                objet_id=vente.id,
+                details={
+                    'numero_vente': numero_vente,
+                    'montant_total': str(vente.montant_total),
+                    'type_vente': type_vente,
+                    'nombre_lignes': len(lignes_data)
+                }
+            )
+        except Exception as e:
+            print(f"⚠️ Audit log error (non bloquant): {e}")
 
         return vente
 
