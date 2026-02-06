@@ -1,4 +1,4 @@
-from django.db.models import Sum, Q
+from django.utils import timezone
 from rest_framework import viewsets, status, permissions
 from rest_framework.response import Response
 from rest_framework.decorators import action
@@ -7,7 +7,8 @@ from knox.models import AuthToken
 from django.db import transaction
 from django.db.models import Sum, Q, Count
 from datetime import datetime, timedelta
-from django.utils import timezone
+from django.http import HttpResponse
+import csv
 
 from .serializers import *
 from .models import *
@@ -538,20 +539,13 @@ class TransfertEntrepotViewSet(viewsets.ModelViewSet):
 
 
 class VenteViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet pour gérer les ventes
-    """
     serializer_class = VenteDetailSerializer
     permission_classes = [IsAdminOrVendeur]
 
     def get_queryset(self):
-        """
-        Retourne le queryset des ventes selon le rôle de l'utilisateur
-        """
         user = self.request.user
         queryset = Vente.objects.all().order_by('-created_at')
 
-        # Filtres de recherche
         statut = self.request.query_params.get('statut')
         if statut:
             queryset = queryset.filter(statut=statut)
@@ -590,57 +584,32 @@ class VenteViewSet(viewsets.ModelViewSet):
         return queryset
 
     def get_serializer_class(self):
-        """
-        Retourne le serializer approprié selon l'action
-        """
         if self.action == 'create':
             return VenteCreateSerializer
         elif self.action in ['update', 'partial_update']:
             return VenteUpdateSerializer
         elif self.action == 'enregistrer_paiement':
             return EnregistrerPaiementSerializer
-        elif self.action in ['list', 'retrieve']:
-            return VenteDetailSerializer
-        return VenteSerializer
-
-    def get_serializer_context(self):
-        """
-        Ajoute le contexte pour les serializers
-        """
-        context = super().get_serializer_context()
-        context['request'] = self.request
-        return context
+        return VenteDetailSerializer
 
     def perform_create(self, serializer):
-        """
-        Ajoute automatiquement created_by à la création
-        """
         serializer.save(created_by=self.request.user)
 
     def create(self, request, *args, **kwargs):
-        """
-        Création d'une vente avec gestion de transaction
-        """
+        """Création d'une vente avec réservation unique du stock"""
         try:
             with transaction.atomic():
-                # Vérifier que l'utilisateur a les permissions
-                if not request.user.is_authenticated:
-                    return Response(
-                        {"error": "Authentication required"},
-                        status=status.HTTP_401_UNAUTHORIZED
-                    )
-
-                # Valider les données
+                # Valider et créer la vente via serializer
                 serializer = self.get_serializer(data=request.data)
                 serializer.is_valid(raise_exception=True)
 
-                # Créer la vente
+                # Sauvegarder la vente
                 self.perform_create(serializer)
-
-                # Récupérer l'instance créée
                 vente = serializer.instance
 
-                # Réserver le stock pour chaque ligne
+                # ✅ UN SEUL ENDROIT POUR RÉSERVER LE STOCK : ICI !
+                stocks_reserves = []
+
                 for ligne in vente.lignes_vente.all():
                     try:
                         stock_entrepot = StockEntrepot.objects.get(
@@ -648,29 +617,56 @@ class VenteViewSet(viewsets.ModelViewSet):
                             entrepot=ligne.entrepot
                         )
 
-                        # Réserver le stock
-                        stock_entrepot.reserver_stock(ligne.quantite)
+                        # Vérifier que la quantité est disponible
+                        stock_disponible = stock_entrepot.quantite - stock_entrepot.quantite_reservee
 
-                        print(
-                            f"✅ Stock réservé: {ligne.produit.nom} - {ligne.quantite} unités")
-                        print(
-                            f"   Stock réservé total: {stock_entrepot.quantite_reservee}")
+                        if ligne.quantite > stock_disponible:
+                            raise serializers.ValidationError({
+                                'lignes_vente': f'Stock insuffisant pour {ligne.produit.nom} dans {ligne.entrepot.nom}. Disponible: {stock_disponible}'
+                            })
+
+                        # Réserver le stock (SEULEMENT ICI)
+                        ancienne_reserve = stock_entrepot.quantite_reservee
+                        stock_entrepot.quantite_reservee += ligne.quantite
+                        stock_entrepot.save()
+
+                        stocks_reserves.append({
+                            'produit': ligne.produit.nom,
+                            'entrepot': ligne.entrepot.nom,
+                            'quantite': ligne.quantite,
+                            'ancienne_reserve': ancienne_reserve,
+                            'nouvelle_reserve': stock_entrepot.quantite_reservee,
+                            'stock_total': stock_entrepot.quantite
+                        })
 
                     except StockEntrepot.DoesNotExist:
-                        # Annuler la transaction si stock non trouvé
                         raise serializers.ValidationError({
                             'lignes_vente': f'Stock non trouvé pour {ligne.produit.nom} dans {ligne.entrepot.nom}'
                         })
 
-                # Mettre à jour les en-têtes de réponse
-                headers = self.get_success_headers(serializer.data)
+                # Log d'audit pour la création avec réservation
+                AuditLog.objects.create(
+                    user=request.user,
+                    action='creation',
+                    modele='Vente',
+                    objet_id=vente.id,
+                    details={
+                        'numero_vente': vente.numero_vente,
+                        'stocks_reserves': stocks_reserves,
+                        'statut': vente.statut
+                    }
+                )
 
-                # Retourner la réponse avec les données détaillées
+                # Retourner la réponse
                 response_serializer = VenteDetailSerializer(vente)
+
                 return Response(
-                    response_serializer.data,
-                    status=status.HTTP_201_CREATED,
-                    headers=headers
+                    {
+                        'message': 'Vente créée avec succès - Stock réservé',
+                        'vente': response_serializer.data,
+                        'stocks_reserves': stocks_reserves
+                    },
+                    status=status.HTTP_201_CREATED
                 )
 
         except serializers.ValidationError as e:
@@ -686,7 +682,8 @@ class VenteViewSet(viewsets.ModelViewSet):
 
     def update(self, request, *args, **kwargs):
         """
-        Mise à jour d'une vente
+        Mise à jour d'une vente avec ajustement intelligent des réservations
+        Évite le double comptage en calculant la différence
         """
         try:
             with transaction.atomic():
@@ -699,30 +696,24 @@ class VenteViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_403_FORBIDDEN
                     )
 
-                # Vérifier que la vente n'est pas confirmée
-                if instance.statut == 'confirmee':
+                # Vérifier que la vente est en brouillon
+                if instance.statut != 'brouillon':
                     return Response(
                         {"error": "Impossible de modifier une vente confirmée"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Libérer l'ancien stock avant validation
-                lignes_data = request.data.get('lignes_vente')
-                if lignes_data:
-                    for ancienne_ligne in instance.lignes_vente.all():
-                        try:
-                            stock_entrepot = StockEntrepot.objects.get(
-                                entrepot=ancienne_ligne.entrepot,
-                                produit=ancienne_ligne.produit
-                            )
-                            if not ancienne_ligne.stock_preleve:
-                                stock_entrepot.liberer_stock(
-                                    ancienne_ligne.quantite)
-                                print(
-                                    f"✅ Ancien stock libéré: {ancienne_ligne.produit.nom} - {ancienne_ligne.quantite} unités")
-                        except StockEntrepot.DoesNotExist:
-                            pass
+                # Sauvegarder les anciennes lignes avec leurs quantités
+                anciennes_lignes_dict = {}
+                for ligne in instance.lignes_vente.all():
+                    key = (ligne.produit_id, ligne.entrepot_id)
+                    anciennes_lignes_dict[key] = {
+                        'quantite': ligne.quantite,
+                        'stock_preleve': ligne.stock_preleve,
+                        'id': ligne.id
+                    }
 
+                # Mettre à jour la vente
                 serializer = self.get_serializer(
                     instance,
                     data=request.data,
@@ -731,113 +722,164 @@ class VenteViewSet(viewsets.ModelViewSet):
                 serializer.is_valid(raise_exception=True)
                 self.perform_update(serializer)
 
-                # Réserver le nouveau stock si des lignes ont été modifiées
-                if lignes_data:
-                    for nouvelle_ligne in instance.lignes_vente.all():
-                        try:
-                            stock_entrepot = StockEntrepot.objects.get(
-                                produit=nouvelle_ligne.produit,
-                                entrepot=nouvelle_ligne.entrepot
-                            )
-                            if not nouvelle_ligne.stock_preleve:
-                                stock_entrepot.reserver_stock(
-                                    nouvelle_ligne.quantite)
-                                print(
-                                    f"✅ Nouveau stock réservé: {nouvelle_ligne.produit.nom} - {nouvelle_ligne.quantite} unités")
-                        except StockEntrepot.DoesNotExist:
-                            pass
-
-                return Response(serializer.data)
-
-        except Exception as e:
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-    def destroy(self, request, *args, **kwargs):
-        """
-        Suppression d'une vente avec libération du stock
-        """
-        try:
-            with transaction.atomic():
-                vente = self.get_object()
-
-                # Vérifier les permissions
-                if request.user.role != 'admin' and vente.created_by != request.user:
-                    return Response(
-                        {"error": "Vous ne pouvez supprimer que vos propres ventes"},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-
-                # Vérifier que la vente est en brouillon
-                if vente.statut != 'brouillon':
-                    return Response(
-                        {"error": "Seules les ventes en brouillon peuvent être supprimées"},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-
-                # Libérer le stock réservé
+                # Traiter les ajustements de stock
+                ajustements = []
+                stocks_reserves = []
                 stocks_liberes = []
-                for ligne in vente.lignes_vente.all():
+
+                # Analyser les nouvelles lignes après la mise à jour
+                for nouvelle_ligne in instance.lignes_vente.all():
+                    key = (nouvelle_ligne.produit_id,
+                           nouvelle_ligne.entrepot_id)
+
                     try:
                         stock_entrepot = StockEntrepot.objects.get(
-                            entrepot=ligne.entrepot,
-                            produit=ligne.produit
+                            produit=nouvelle_ligne.produit,
+                            entrepot=nouvelle_ligne.entrepot
                         )
 
-                        # Libérer seulement si pas déjà prélevé
-                        if not ligne.stock_preleve:
+                        if key in anciennes_lignes_dict:
+                            # Ligne existante modifiée
+                            ancienne_quantite = anciennes_lignes_dict[key]['quantite']
+                            nouvelle_quantite = nouvelle_ligne.quantite
+
+                            # Calculer la différence
+                            difference = nouvelle_quantite - ancienne_quantite
+
+                            if difference > 0:
+                                # Augmentation de la quantité - vérifier disponibilité
+                                stock_disponible = stock_entrepot.quantite - stock_entrepot.quantite_reservee
+
+                                if difference > stock_disponible:
+                                    raise serializers.ValidationError({
+                                        'lignes_vente': f'Stock insuffisant pour augmenter {nouvelle_ligne.produit.nom}. Différence: {difference}, Disponible: {stock_disponible}'
+                                    })
+
+                                # Réserver la différence
+                                ancienne_reserve = stock_entrepot.quantite_reservee
+                                stock_entrepot.quantite_reservee += difference
+                                stock_entrepot.save()
+
+                                ajustements.append({
+                                    'produit': nouvelle_ligne.produit.nom,
+                                    'entrepot': nouvelle_ligne.entrepot.nom,
+                                    'type': 'augmentation',
+                                    'ancienne_quantite': ancienne_quantite,
+                                    'nouvelle_quantite': nouvelle_quantite,
+                                    'difference': difference,
+                                    'ancienne_reserve': ancienne_reserve,
+                                    'nouvelle_reserve': stock_entrepot.quantite_reservee
+                                })
+
+                            elif difference < 0:
+                                # Diminution de la quantité - libérer la différence
+                                ancienne_reserve = stock_entrepot.quantite_reservee
+                                stock_entrepot.quantite_reservee = max(
+                                    0, stock_entrepot.quantite_reservee + difference  # difference est négative
+                                )
+                                stock_entrepot.save()
+
+                                ajustements.append({
+                                    'produit': nouvelle_ligne.produit.nom,
+                                    'entrepot': nouvelle_ligne.entrepot.nom,
+                                    'type': 'diminution',
+                                    'ancienne_quantite': ancienne_quantite,
+                                    'nouvelle_quantite': nouvelle_quantite,
+                                    'difference': difference,
+                                    'ancienne_reserve': ancienne_reserve,
+                                    'nouvelle_reserve': stock_entrepot.quantite_reservee
+                                })
+                                stocks_liberes.append({
+                                    'produit': nouvelle_ligne.produit.nom,
+                                    'entrepot': nouvelle_ligne.entrepot.nom,
+                                    'quantite_liberee': abs(difference)
+                                })
+
+                        else:
+                            # Nouvelle ligne - réserver la quantité
+                            if not nouvelle_ligne.stock_preleve:
+                                stock_disponible = stock_entrepot.quantite - stock_entrepot.quantite_reservee
+
+                                if nouvelle_ligne.quantite > stock_disponible:
+                                    raise serializers.ValidationError({
+                                        'lignes_vente': f'Stock insuffisant pour {nouvelle_ligne.produit.nom}. Demandé: {nouvelle_ligne.quantite}, Disponible: {stock_disponible}'
+                                    })
+
+                                ancienne_reserve = stock_entrepot.quantite_reservee
+                                stock_entrepot.quantite_reservee += nouvelle_ligne.quantite
+                                stock_entrepot.save()
+
+                                stocks_reserves.append({
+                                    'produit': nouvelle_ligne.produit.nom,
+                                    'entrepot': nouvelle_ligne.entrepot.nom,
+                                    'quantite': nouvelle_ligne.quantite,
+                                    'ancienne_reserve': ancienne_reserve,
+                                    'nouvelle_reserve': stock_entrepot.quantite_reservee
+                                })
+
+                        # Supprimer de la liste des anciennes lignes
+                        if key in anciennes_lignes_dict:
+                            del anciennes_lignes_dict[key]
+
+                    except StockEntrepot.DoesNotExist:
+                        raise serializers.ValidationError({
+                            'lignes_vente': f'Stock non trouvé pour {nouvelle_ligne.produit.nom} dans {nouvelle_ligne.entrepot.nom}'
+                        })
+
+                # Libérer le stock des lignes supprimées
+                for key, ancienne_ligne in anciennes_lignes_dict.items():
+                    # Ne libérer que si pas prélevé
+                    if not ancienne_ligne['stock_preleve']:
+                        try:
+                            stock_entrepot = StockEntrepot.objects.get(
+                                produit_id=key[0],
+                                entrepot_id=key[1]
+                            )
+
                             ancienne_reserve = stock_entrepot.quantite_reservee
-
-                            # S'assurer qu'on ne libère pas plus que ce qui est réservé
-                            if ligne.quantite <= stock_entrepot.quantite_reservee:
-                                stock_entrepot.quantite_reservee -= ligne.quantite
-                            else:
-                                stock_entrepot.quantite_reservee = 0
-
+                            stock_entrepot.quantite_reservee = max(
+                                0, stock_entrepot.quantite_reservee -
+                                ancienne_ligne['quantite']
+                            )
                             stock_entrepot.save()
 
                             stocks_liberes.append({
-                                'produit': ligne.produit.nom,
-                                'entrepot': ligne.entrepot.nom,
-                                'quantite': ligne.quantite,
+                                'produit_id': key[0],
+                                'entrepot_id': key[1],
+                                'quantite_liberee': ancienne_ligne['quantite'],
                                 'ancienne_reserve': ancienne_reserve,
                                 'nouvelle_reserve': stock_entrepot.quantite_reservee
                             })
 
-                            print(
-                                f"✅ Stock libéré (suppression): {ligne.produit.nom} - {ligne.quantite} unités")
+                        except StockEntrepot.DoesNotExist:
+                            continue
 
-                    except StockEntrepot.DoesNotExist:
-                        continue
-
-                # Créer un log avant suppression
+                # Log d'audit pour la modification
                 AuditLog.objects.create(
                     user=request.user,
-                    action='suppression',
+                    action='modification',
                     modele='Vente',
-                    objet_id=vente.id,
+                    objet_id=instance.id,
                     details={
-                        'numero_vente': vente.numero_vente,
-                        'montant_total': str(vente.montant_total),
-                        'stocks_liberes': stocks_liberes,
-                        'statut': vente.statut
+                        'numero_vente': instance.numero_vente,
+                        'ajustements': ajustements,
+                        'stocks_reserves': stocks_reserves,
+                        'stocks_liberes': stocks_liberes
                     }
                 )
 
-                # Supprimer la vente
-                vente.delete()
-
                 return Response({
-                    'message': 'Vente supprimée avec succès',
+                    'message': 'Vente mise à jour avec succès',
+                    'vente': serializer.data,
+                    'ajustements': ajustements,
+                    'stocks_reserves': stocks_reserves,
                     'stocks_liberes': stocks_liberes
-                }, status=status.HTTP_200_OK)
+                })
 
-        except Vente.DoesNotExist:
+        except serializers.ValidationError as e:
             return Response(
-                {"error": "Vente non trouvée"},
-                status=status.HTTP_404_NOT_FOUND
+                {"error": e.detail},
+                status=status.HTTP_400_BAD_REQUEST
             )
         except Exception as e:
             return Response(
@@ -847,106 +889,25 @@ class VenteViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def confirmer(self, request, pk=None):
-        """
-        Confirmer une vente (passer de brouillon à confirmée)
-        """
         try:
             with transaction.atomic():
                 vente = self.get_object()
 
-                # Vérifier les permissions
-                if request.user.role != 'admin' and vente.created_by != request.user:
-                    return Response(
-                        {"error": "Vous ne pouvez confirmer que vos propres ventes"},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-
-                # Vérifier que la vente est en brouillon
                 if vente.statut != 'brouillon':
                     return Response(
                         {"error": "Seules les ventes en brouillon peuvent être confirmées"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Vérifier qu'il y a des lignes de vente
                 if not vente.lignes_vente.exists():
                     return Response(
                         {"error": "La vente ne contient aucun produit"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Vérifier le stock disponible et prélèvement
-                mouvements_crees = []
-                for ligne in vente.lignes_vente.all():
-                    try:
-                        stock_entrepot = StockEntrepot.objects.get(
-                            produit=ligne.produit,
-                            entrepot=ligne.entrepot
-                        )
+                vente.confirmer_vente()
 
-                        # Vérifier le stock réservé (doit correspondre à la quantité)
-                        if ligne.quantite > stock_entrepot.quantite_reservee:
-                            return Response(
-                                {"error": f"Quantité réservée insuffisante pour {ligne.produit.nom} dans {ligne.entrepot.nom}"},
-                                status=status.HTTP_400_BAD_REQUEST
-                            )
-
-                        # PRÉLÈVER LE STOCK (déduire du stock total et du stock réservé)
-                        stock_entrepot.quantite -= ligne.quantite
-                        stock_entrepot.quantite_reservee -= ligne.quantite
-                        stock_entrepot.save()
-
-                        # Marquer la ligne comme prélevée
-                        ligne.stock_preleve = True
-                        ligne.save()
-
-                        # Créer un mouvement de stock
-                        mouvement = MouvementStock.objects.create(
-                            produit=ligne.produit,
-                            type_mouvement='sortie',
-                            quantite=ligne.quantite,
-                            prix_unitaire=ligne.prix_unitaire,
-                            motif=f"Vente confirmée {vente.numero_vente}" +
-                            (f" - Client: {vente.client.nom}" if vente.client else ""),
-                            source='vente',
-                            vente=vente,
-                            entrepot=ligne.entrepot,
-                            created_by=request.user
-                        )
-                        mouvements_crees.append(mouvement.id)
-
-                        print(
-                            f"✅ Stock prélevé: {ligne.produit.nom} - {ligne.quantite} unités")
-                        print(f"   Stock restant: {stock_entrepot.quantite}")
-                        print(
-                            f"   Stock réservé restant: {stock_entrepot.quantite_reservee}")
-
-                    except StockEntrepot.DoesNotExist:
-                        return Response(
-                            {"error": f"Le produit {ligne.produit.nom} n'est pas disponible dans {ligne.entrepot.nom}"},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-
-                # Confirmer la vente
-                vente.statut = 'confirmee'
-                vente.date_confirmation = timezone.now()
-                vente.confirmed_by = request.user
-                vente.save()
-
-                # Créer un log d'audit
-                AuditLog.objects.create(
-                    user=request.user,
-                    action='confirmation',
-                    modele='Vente',
-                    objet_id=vente.id,
-                    details={
-                        'numero_vente': vente.numero_vente,
-                        'montant_total': str(vente.montant_total),
-                        'statut_paiement': vente.statut_paiement,
-                        'nombre_lignes': vente.lignes_vente.count(),
-                        'mouvements_crees': mouvements_crees
-                    }
-                )
+                vente.refresh_from_db()
 
                 return Response({
                     "message": "Vente confirmée avec succès",
@@ -954,41 +915,44 @@ class VenteViewSet(viewsets.ModelViewSet):
                 }, status=status.HTTP_200_OK)
 
         except Vente.DoesNotExist:
-            return Response(
-                {"error": "Vente non trouvée"},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"error": "Vente non trouvée"}, status=status.HTTP_404_NOT_FOUND)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            return Response(
-                {"error": f"Erreur interne: {str(e)}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({"error": f"Erreur interne: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'])
     def annuler(self, request, pk=None):
-        """
-        Annuler une vente
-        """
         try:
             with transaction.atomic():
                 vente = self.get_object()
 
-                # Vérifier les permissions
-                if request.user.role != 'admin' and vente.created_by != request.user:
-                    return Response(
-                        {"error": "Vous ne pouvez annuler que vos propres ventes"},
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-
-                # Vérifier que la vente est en brouillon
                 if vente.statut != 'brouillon':
                     return Response(
                         {"error": "Seules les ventes en brouillon peuvent être annulées"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Utiliser la méthode du modèle
-                stocks_libérés = vente.annuler_et_liberer_stock()
+                stocks_libérés = []
+                for ligne in vente.lignes_vente.all():
+                    try:
+                        stock_entrepot = StockEntrepot.objects.get(
+                            produit=ligne.produit,
+                            entrepot=ligne.entrepot
+                        )
+                        stock_entrepot.liberer_stock(ligne.quantite)
+                        stocks_libérés.append({
+                            'produit': ligne.produit.nom,
+                            'entrepot': ligne.entrepot.nom,
+                            'quantite': ligne.quantite
+                        })
+                    except StockEntrepot.DoesNotExist:
+                        continue
+
+                vente.statut = 'annulee'
+                vente.save()
+
+                vente.refresh_from_db()
 
                 return Response({
                     "message": "Vente annulée avec succès",
@@ -997,113 +961,126 @@ class VenteViewSet(viewsets.ModelViewSet):
                 }, status=status.HTTP_200_OK)
 
         except Vente.DoesNotExist:
-            return Response(
-                {"error": "Vente non trouvée"},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"error": "Vente non trouvée"}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'])
     def enregistrer_paiement(self, request, pk=None):
-        """
-        Enregistrer un paiement pour une vente
-        """
         try:
             with transaction.atomic():
                 vente = self.get_object()
 
-                # Vérifier que la vente est confirmée
                 if vente.statut != 'confirmee':
                     return Response(
                         {"error": "Seules les ventes confirmées peuvent recevoir des paiements"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Vérifier que la vente n'est pas déjà entièrement payée
                 if vente.statut_paiement == 'paye':
                     return Response(
                         {"error": "Cette vente est déjà entièrement payée"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Valider les données du paiement
                 serializer = EnregistrerPaiementSerializer(
                     data=request.data,
                     context={'vente': vente}
                 )
-                serializer.is_valid(raise_exception=True)
-                data = serializer.validated_data
 
-                # Créer le paiement
-                paiement = Paiement.objects.create(
-                    vente=vente,
-                    montant=data['montant'],
-                    mode_paiement=data['mode_paiement'],
-                    reference=data.get('reference', ''),
-                    notes=data.get('notes', ''),
-                    created_by=request.user
-                )
+                if serializer.is_valid():
+                    data = serializer.validated_data
 
-                # Mettre à jour les informations de la vente
-                vente.montant_paye += data['montant']
-                vente.montant_restant = max(
-                    0, vente.montant_total - vente.montant_paye)
+                    paiement = Paiement.objects.create(
+                        vente=vente,
+                        montant=data['montant'],
+                        mode_paiement=data['mode_paiement'],
+                        reference=data.get('reference', ''),
+                        notes=data.get('notes', ''),
+                        created_by=request.user
+                    )
 
-                # Mettre à jour le statut de paiement
-                if vente.montant_paye >= vente.montant_total:
-                    vente.statut_paiement = 'paye'
-                elif vente.montant_paye > 0:
-                    vente.statut_paiement = 'partiel'
-                else:
-                    vente.statut_paiement = 'non_paye'
+                    vente.montant_paye += data['montant']
 
-                # Mettre à jour le mode de paiement si nécessaire
-                if not vente.mode_paiement:
-                    vente.mode_paiement = data['mode_paiement']
+                    if not vente.mode_paiement:
+                        vente.mode_paiement = data['mode_paiement']
 
-                vente.save()
+                    vente.update_statut_paiement()
 
-                # Créer un log d'audit
-                AuditLog.objects.create(
-                    user=request.user,
-                    action='paiement',
-                    modele='Paiement',
-                    objet_id=paiement.id,
-                    details={
-                        'numero_vente': vente.numero_vente,
-                        'montant_paye': str(data['montant']),
-                        'mode_paiement': data['mode_paiement'],
-                        'nouveau_statut': vente.statut_paiement,
-                        'paiement_id': paiement.id
-                    }
-                )
+                    AuditLog.objects.create(
+                        user=request.user,
+                        action='vente',
+                        modele='Paiement',
+                        objet_id=paiement.id,
+                        details={
+                            'vente': vente.numero_vente,
+                            'montant': str(data['montant']),
+                            'mode_paiement': data['mode_paiement'],
+                            'nouveau_statut': vente.statut_paiement
+                        }
+                    )
+
+                    return Response({
+                        'message': 'Paiement enregistré avec succès',
+                        'paiement': PaiementSerializer(paiement).data,
+                        'vente': VenteDetailSerializer(vente).data
+                    }, status=status.HTTP_200_OK)
+
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        except Vente.DoesNotExist:
+            return Response({'error': 'Vente non trouvée'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    def destroy(self, request, pk=None):
+        """Surcharger la suppression pour libérer le stock réservé"""
+        try:
+            with transaction.atomic():
+                vente = self.get_object()
+
+                # Libérer le stock réservé si la vente est en brouillon
+                if vente.statut == 'brouillon':
+                    stocks_libérés = []
+                    for ligne in vente.lignes_vente.all():
+                        try:
+                            stock_entrepot = StockEntrepot.objects.get(
+                                entrepot=ligne.entrepot,
+                                produit=ligne.produit
+                            )
+
+                            ancienne_reserve = stock_entrepot.quantite_reservee
+                            nouvelle_reserve = max(
+                                0, ancienne_reserve - ligne.quantite)
+                            stock_entrepot.quantite_reservee = nouvelle_reserve
+                            stock_entrepot.save()
+
+                            stocks_libérés.append({
+                                'produit': ligne.produit.nom,
+                                'entrepot': ligne.entrepot.nom,
+                                'quantite': ligne.quantite,
+                                'ancienne_reserve': ancienne_reserve,
+                                'nouvelle_reserve': nouvelle_reserve
+                            })
+
+                        except StockEntrepot.DoesNotExist:
+                            continue
+
+                # Supprimer la vente
+                vente.delete()
 
                 return Response({
-                    'message': 'Paiement enregistré avec succès',
-                    'paiement': PaiementSerializer(paiement).data,
-                    'vente': VenteDetailSerializer(vente).data
+                    'message': 'Vente supprimée avec succès',
+                    'stocks_libérés': stocks_libérés
                 }, status=status.HTTP_200_OK)
 
         except Vente.DoesNotExist:
-            return Response(
-                {'error': 'Vente non trouvée'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({'error': 'Vente non trouvée'}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=False, methods=['get'])
     def statistiques(self, request):
-        """
-        Statistiques générales sur les ventes
-        """
         user = request.user
         queryset = self.get_queryset()
 
@@ -1134,8 +1111,8 @@ class VenteViewSet(viewsets.ModelViewSet):
             'ventes_confirmees': ventes_confirmees,
             'ventes_brouillon': ventes_brouillon,
             'ventes_annulees': ventes_annulees,
-            'chiffre_affaires': float(chiffre_affaires),
-            'montant_a_recouvrer': float(montant_a_recouvrer),
+            'chiffre_affaires': chiffre_affaires,
+            'montant_a_recouvrer': montant_a_recouvrer,
             'ventes_en_retard': ventes_en_retard,
             'taux_confirmation': (ventes_confirmees / total_ventes * 100) if total_ventes > 0 else 0,
             'taux_paiement': ((chiffre_affaires - montant_a_recouvrer) / chiffre_affaires * 100)
@@ -1144,9 +1121,7 @@ class VenteViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def ventes_impayees(self, request):
-        """
-        Liste des ventes impayées ou partiellement payées
-        """
+        """Liste des ventes impayées ou partiellement payées"""
         queryset = self.get_queryset().filter(
             statut='confirmee',
             statut_paiement__in=['non_paye', 'partiel']
@@ -1162,9 +1137,7 @@ class VenteViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def ventes_en_retard(self, request):
-        """
-        Liste des ventes en retard de paiement
-        """
+        """Liste des ventes en retard de paiement"""
         queryset = self.get_queryset().filter(
             statut='confirmee',
             statut_paiement__in=['non_paye', 'partiel', 'retard'],
@@ -1175,22 +1148,15 @@ class VenteViewSet(viewsets.ModelViewSet):
         result = []
         for vente in queryset:
             data = VenteDetailSerializer(vente).data
-            if hasattr(vente, 'jours_retard'):
-                data['jours_retard'] = vente.jours_retard()
-            elif hasattr(vente, 'date_echeance') and vente.date_echeance:
-                data['jours_retard'] = (
-                    timezone.now().date() - vente.date_echeance).days
-            else:
-                data['jours_retard'] = 0
+            data['jours_retard'] = vente.jours_retard(
+            ) if hasattr(vente, 'jours_retard') else 0
             result.append(data)
 
         return Response(result)
 
     @action(detail=True, methods=['get'])
     def paiements(self, request, pk=None):
-        """
-        Liste des paiements d'une vente
-        """
+        """Liste des paiements d'une vente"""
         try:
             vente = self.get_object()
             paiements = vente.paiements.all().order_by('-date_paiement')
@@ -1204,16 +1170,11 @@ class VenteViewSet(viewsets.ModelViewSet):
             })
 
         except Vente.DoesNotExist:
-            return Response(
-                {"error": "Vente non trouvée"},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"error": "Vente non trouvée"}, status=status.HTTP_404_NOT_FOUND)
 
     @action(detail=False, methods=['get'])
     def ventes_du_jour(self, request):
-        """
-        Liste des ventes créées aujourd'hui
-        """
+        """Liste des ventes créées aujourd'hui"""
         aujourd_hui = timezone.now().date()
         queryset = self.get_queryset().filter(
             created_at__date=aujourd_hui
@@ -1234,9 +1195,7 @@ class VenteViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def ventes_du_mois(self, request):
-        """
-        Statistiques des ventes du mois en cours
-        """
+        """Statistiques des ventes du mois en cours"""
         debut_mois = timezone.now().replace(day=1).date()
         aujourd_hui = timezone.now().date()
 
@@ -1290,12 +1249,7 @@ class VenteViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def export_csv(self, request):
-        """
-        Exporter les ventes en CSV (version simplifiée)
-        """
-        from django.http import HttpResponse
-        import csv
-
+        """Exporter les ventes en CSV"""
         queryset = self.get_queryset()
 
         # Créer la réponse HTTP avec le type CSV

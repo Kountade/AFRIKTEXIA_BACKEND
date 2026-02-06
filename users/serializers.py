@@ -231,7 +231,6 @@ class LigneDeVenteCreateSerializer(serializers.ModelSerializer):
             'produit': {'required': True},
             'entrepot': {'required': True},
             'quantite': {'required': True},
-
         }
 
 
@@ -315,7 +314,7 @@ class VenteCreateSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
-        """Création simplifiée et robuste comme l'Application 2"""
+        """Création simplifiée SANS réservation de stock"""
         lignes_data = validated_data.pop('lignes_vente')
 
         # Récupérer l'utilisateur depuis le contexte
@@ -324,7 +323,7 @@ class VenteCreateSerializer(serializers.ModelSerializer):
 
         if not user or not user.is_authenticated:
             raise serializers.ValidationError({
-                'non_field_errors': 'Utilisateur non authentifié'
+                'non_field_errors': 'Utilisateur non authentiqué'
             })
 
         # Générer numéro de vente
@@ -354,10 +353,10 @@ class VenteCreateSerializer(serializers.ModelSerializer):
             montant_paye=validated_data.get('montant_paye', 0),
             date_echeance=validated_data.get('date_echeance'),
             notes=validated_data.get('notes', ''),
-            created_by=user  # ⚠️ IMPORTANT: Ajouter created_by ici
+            created_by=user
         )
 
-        # Créer les lignes de vente
+        # Créer les lignes de vente SANS RÉSERVER LE STOCK ICI
         entrepots_utilises = set()
         montant_total = 0
 
@@ -393,20 +392,7 @@ class VenteCreateSerializer(serializers.ModelSerializer):
             montant_total += sous_total
             entrepots_utilises.add(entrepot)
 
-            # Réserver le stock (version simplifiée)
-            try:
-                stock_entrepot = StockEntrepot.objects.get(
-                    produit=produit,
-                    entrepot=entrepot
-                )
-
-                # Utiliser la méthode reserver_stock() du modèle
-                stock_entrepot.reserver_stock(quantite)
-
-            except StockEntrepot.DoesNotExist:
-                raise serializers.ValidationError({
-                    'lignes_vente': f'Stock non trouvé pour {produit.nom} dans {entrepot.nom}'
-                })
+            # ⚠️ NE PAS RÉSERVER LE STOCK ICI - Cela sera fait dans la vue
 
         # Ajouter les entrepôts à la vente
         vente.entrepots.set(entrepots_utilises)
@@ -564,18 +550,16 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         lignes_data = validated_data.pop('lignes_vente', None)
 
-        # Libérer les stocks des anciennes lignes si de nouvelles lignes sont fournies
-        if lignes_data:
-            for ancienne_ligne in instance.lignes_vente.all():
-                try:
-                    stock_entrepot = StockEntrepot.objects.get(
-                        entrepot=ancienne_ligne.entrepot,
-                        produit=ancienne_ligne.produit
-                    )
-                    stock_entrepot.liberer_stock(ancienne_ligne.quantite)
-                except StockEntrepot.DoesNotExist:
-                    pass
+        # ⚠️ IMPORTANT : NE PAS libérer/réserver le stock ici !
+        # La vue VenteViewSet.update() gère cela avec calcul intelligent des différences
 
+        # Mettre à jour les autres champs
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+
+        # Si des lignes sont fournies, simplement les mettre à jour
+        # Le stock sera ajusté dans la vue
+        if lignes_data:
             # Supprimer les anciennes lignes
             instance.lignes_vente.all().delete()
 
@@ -586,19 +570,8 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
                     vente=instance, **ligne_data)
                 entrepots_utilises.add(ligne.entrepot)
 
-                # Réserver le stock dans l'entrepôt
-                stock_entrepot = StockEntrepot.objects.get(
-                    produit=ligne.produit,
-                    entrepot=ligne.entrepot
-                )
-                stock_entrepot.reserver_stock(ligne.quantite)
-
             # Mettre à jour les entrepôts
             instance.entrepots.set(entrepots_utilises)
-
-        # Mettre à jour les autres champs
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
 
         # Recalculer le montant total
         instance.montant_total = instance.calculer_total()
