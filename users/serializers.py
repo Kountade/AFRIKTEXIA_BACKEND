@@ -264,27 +264,69 @@ class VenteSerializer(serializers.ModelSerializer):
         return [entrepot.nom for entrepot in obj.entrepots.all()]
 
 
+class PaiementSerializer(serializers.ModelSerializer):
+    created_by_email = serializers.CharField(
+        source='created_by.email', read_only=True)
+    mode_paiement_display = serializers.CharField(
+        source='get_mode_paiement_display', read_only=True)
+
+    class Meta:
+        model = Paiement
+        fields = '__all__'
+        read_only_fields = ('created_by', 'date_paiement')
+
+
+class FactureSerializer(serializers.ModelSerializer):
+    vente_numero = serializers.CharField(
+        source='vente.numero_vente', read_only=True)
+
+    class Meta:
+        model = Facture
+        fields = '__all__'
+
+
 class VenteCreateSerializer(serializers.ModelSerializer):
     lignes_vente = LigneDeVenteCreateSerializer(many=True, write_only=True)
 
     class Meta:
         model = Vente
-        fields = ('client', 'type_vente', 'remise', 'lignes_vente', 'mode_paiement',
-                  'montant_paye', 'date_echeance', 'notes')
+        fields = (
+            'client', 'type_vente', 'type_reduction', 'valeur_reduction',
+            'lignes_vente', 'mode_paiement', 'montant_paye',
+            'date_echeance', 'notes'
+        )
         read_only_fields = ('created_by', 'created_at', 'numero_vente')
         extra_kwargs = {
             'client': {'required': False, 'allow_null': True},
-            'remise': {'required': False, 'default': 0},
-            'type_vente': {'required': False, 'default': 'detail'}
+            'type_reduction': {'required': False, 'default': 'aucune'},
+            'valeur_reduction': {'required': False, 'default': 0, 'min_value': 0},
+            'type_vente': {'required': False, 'default': 'detail'},
+            'montant_paye': {'required': False, 'default': 0},
         }
 
-    def validate_lignes_vente(self, value):
-        if not value or len(value) == 0:
+    def validate(self, data):
+        # Validation pour les réductions
+        type_reduction = data.get('type_reduction', 'aucune')
+        valeur_reduction = data.get('valeur_reduction', 0)
+
+        if type_reduction != 'aucune' and valeur_reduction <= 0:
+            raise serializers.ValidationError({
+                'valeur_reduction': 'La valeur de réduction doit être positive'
+            })
+
+        if type_reduction == 'pourcentage' and valeur_reduction > 100:
+            raise serializers.ValidationError({
+                'valeur_reduction': 'Le pourcentage de réduction ne peut pas dépasser 100%'
+            })
+
+        # Validation des lignes
+        lignes_data = data.get('lignes_vente')
+        if not lignes_data or len(lignes_data) == 0:
             raise serializers.ValidationError(
                 "Au moins une ligne de vente est requise."
             )
 
-        for ligne in value:
+        for ligne in lignes_data:
             produit = ligne.get('produit')
             entrepot = ligne.get('entrepot')
             quantite = ligne.get('quantite')
@@ -310,11 +352,11 @@ class VenteCreateSerializer(serializers.ModelSerializer):
                     f"Le produit {produit.nom} n'est pas disponible dans {entrepot.nom}"
                 )
 
-        return value
+        return data
 
     @transaction.atomic
     def create(self, validated_data):
-        """Création simplifiée SANS réservation de stock"""
+        """Création de vente avec réduction générale"""
         lignes_data = validated_data.pop('lignes_vente')
 
         # Récupérer l'utilisateur depuis le contexte
@@ -343,12 +385,13 @@ class VenteCreateSerializer(serializers.ModelSerializer):
 
         numero_vente = f'V{today}{new_number:04d}'
 
-        # Créer la vente AVEC created_by
+        # Créer la vente avec les données de réduction
         vente = Vente.objects.create(
             numero_vente=numero_vente,
             client=validated_data.get('client'),
             type_vente=validated_data.get('type_vente', 'detail'),
-            remise=validated_data.get('remise', 0),
+            type_reduction=validated_data.get('type_reduction', 'aucune'),
+            valeur_reduction=validated_data.get('valeur_reduction', 0),
             mode_paiement=validated_data.get('mode_paiement'),
             montant_paye=validated_data.get('montant_paye', 0),
             date_echeance=validated_data.get('date_echeance'),
@@ -356,9 +399,9 @@ class VenteCreateSerializer(serializers.ModelSerializer):
             created_by=user
         )
 
-        # Créer les lignes de vente SANS RÉSERVER LE STOCK ICI
+        # Créer les lignes de vente
         entrepots_utilises = set()
-        montant_total = 0
+        montant_total_lignes = 0
 
         for ligne_data in lignes_data:
             produit = ligne_data.get('produit')
@@ -389,32 +432,41 @@ class VenteCreateSerializer(serializers.ModelSerializer):
             ligne.montant_total = sous_total
             ligne.save()
 
-            montant_total += sous_total
+            montant_total_lignes += sous_total
             entrepots_utilises.add(entrepot)
-
-            # ⚠️ NE PAS RÉSERVER LE STOCK ICI - Cela sera fait dans la vue
 
         # Ajouter les entrepôts à la vente
         vente.entrepots.set(entrepots_utilises)
 
-        # Appliquer la remise
-        remise = validated_data.get('remise', 0)
-        if remise > 0 and remise <= 100:
-            montant_remise = montant_total * remise / 100
-            montant_total_apres_remise = montant_total - montant_remise
-        else:
-            montant_remise = 0
-            montant_total_apres_remise = montant_total
+        # Calculer la réduction générale
+        type_reduction = validated_data.get('type_reduction', 'aucune')
+        valeur_reduction = validated_data.get('valeur_reduction', 0)
 
-        # Mettre à jour la vente
-        vente.montant_total = montant_total_apres_remise
-        vente.montant_avant_remise = montant_total
-        vente.montant_remise = montant_remise
+        montant_reduction = 0
+        if type_reduction != 'aucune' and valeur_reduction > 0:
+            if type_reduction == 'pourcentage':
+                montant_reduction = (
+                    montant_total_lignes * valeur_reduction) / 100
+            else:  # Montant fixe
+                montant_reduction = valeur_reduction
+
+            # Limiter la réduction au montant total
+            if montant_reduction > montant_total_lignes:
+                montant_reduction = montant_total_lignes
+
+        montant_total_apres_reduction = montant_total_lignes - montant_reduction
+
+        # Mettre à jour la vente avec les montants calculés
+        vente.montant_avant_reduction = montant_total_lignes
+        vente.montant_reduction = montant_reduction
+        vente.montant_total = montant_total_apres_reduction
+        vente.montant_remise = montant_reduction
         vente.montant_restant = max(
-            0, montant_total_apres_remise - vente.montant_paye)
+            0, montant_total_apres_reduction - vente.montant_paye
+        )
 
         # Déterminer statut paiement
-        if vente.montant_paye >= montant_total_apres_remise:
+        if vente.montant_paye >= montant_total_apres_reduction:
             vente.statut_paiement = 'paye'
         elif vente.montant_paye > 0:
             vente.statut_paiement = 'partiel'
@@ -433,6 +485,9 @@ class VenteCreateSerializer(serializers.ModelSerializer):
                 details={
                     'numero_vente': numero_vente,
                     'montant_total': str(vente.montant_total),
+                    'montant_reduction': str(montant_reduction),
+                    'type_reduction': type_reduction,
+                    'valeur_reduction': str(valeur_reduction),
                     'type_vente': type_vente,
                     'nombre_lignes': len(lignes_data)
                 }
@@ -443,61 +498,17 @@ class VenteCreateSerializer(serializers.ModelSerializer):
         return vente
 
 
-class PaiementSerializer(serializers.ModelSerializer):
-    created_by_email = serializers.CharField(
-        source='created_by.email', read_only=True)
-    mode_paiement_display = serializers.CharField(
-        source='get_mode_paiement_display', read_only=True)
-
-    class Meta:
-        model = Paiement
-        fields = '__all__'
-        read_only_fields = ('created_by', 'date_paiement')
-
-
-class FactureSerializer(serializers.ModelSerializer):
-    vente_numero = serializers.CharField(
-        source='vente.numero_vente', read_only=True)
-
-    class Meta:
-        model = Facture
-        fields = '__all__'
-
-
-class VenteDetailSerializer(serializers.ModelSerializer):
-    client_nom = serializers.CharField(source='client.nom', read_only=True)
-    created_by_email = serializers.CharField(
-        source='created_by.email', read_only=True)
-    lignes_vente = LigneDeVenteSerializer(many=True, read_only=True)
-    paiements = PaiementSerializer(many=True, read_only=True)
-    facture = FactureSerializer(read_only=True)
-    pourcentage_paye = serializers.SerializerMethodField()
-    jours_retard = serializers.SerializerMethodField()
-    statut_paiement_display = serializers.CharField(
-        source='get_statut_paiement_display', read_only=True)
-    mode_paiement_display = serializers.CharField(
-        source='get_mode_paiement_display', read_only=True)
-
-    class Meta:
-        model = Vente
-        fields = '__all__'
-        read_only_fields = ('created_by', 'created_at', 'numero_vente')
-
-    def get_pourcentage_paye(self, obj):
-        return obj.pourcentage_paye()
-
-    def get_jours_retard(self, obj):
-        return obj.jours_retard()
-
-
 class VenteUpdateSerializer(serializers.ModelSerializer):
     lignes_vente = LigneDeVenteCreateSerializer(
         many=True, write_only=True, required=False)
 
     class Meta:
         model = Vente
-        fields = ('client', 'remise', 'lignes_vente', 'mode_paiement',
-                  'montant_paye', 'date_echeance', 'notes', 'statut')
+        fields = (
+            'client', 'type_vente', 'type_reduction', 'valeur_reduction',
+            'lignes_vente', 'mode_paiement', 'montant_paye',
+            'date_echeance', 'notes', 'statut'
+        )
         read_only_fields = ('created_by', 'created_at', 'numero_vente')
 
     def validate(self, data):
@@ -507,6 +518,21 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Seules les ventes en brouillon peuvent être modifiées"
             )
+
+        # Validation pour les réductions
+        type_reduction = data.get('type_reduction')
+        valeur_reduction = data.get('valeur_reduction')
+
+        if type_reduction and type_reduction != 'aucune':
+            if not valeur_reduction or valeur_reduction <= 0:
+                raise serializers.ValidationError({
+                    'valeur_reduction': 'La valeur de réduction doit être positive'
+                })
+
+            if type_reduction == 'pourcentage' and valeur_reduction > 100:
+                raise serializers.ValidationError({
+                    'valeur_reduction': 'Le pourcentage de réduction ne peut pas dépasser 100%'
+                })
 
         lignes_data = data.get('lignes_vente')
         if lignes_data:
@@ -550,15 +576,18 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         lignes_data = validated_data.pop('lignes_vente', None)
 
-        # ⚠️ IMPORTANT : NE PAS libérer/réserver le stock ici !
-        # La vue VenteViewSet.update() gère cela avec calcul intelligent des différences
+        # Mettre à jour les champs de réduction
+        if 'type_reduction' in validated_data:
+            instance.type_reduction = validated_data['type_reduction']
+        if 'valeur_reduction' in validated_data:
+            instance.valeur_reduction = validated_data['valeur_reduction']
 
         # Mettre à jour les autres champs
         for attr, value in validated_data.items():
-            setattr(instance, attr, value)
+            if attr not in ['type_reduction', 'valeur_reduction']:
+                setattr(instance, attr, value)
 
-        # Si des lignes sont fournies, simplement les mettre à jour
-        # Le stock sera ajusté dans la vue
+        # Si des lignes sont fournies, les mettre à jour
         if lignes_data:
             # Supprimer les anciennes lignes
             instance.lignes_vente.all().delete()
@@ -573,11 +602,62 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
             # Mettre à jour les entrepôts
             instance.entrepots.set(entrepots_utilises)
 
-        # Recalculer le montant total
-        instance.montant_total = instance.calculer_total()
+        # Recalculer les totaux avec la réduction
+        instance.calculer_total()
         instance.save()
 
         return instance
+
+
+class VenteDetailSerializer(serializers.ModelSerializer):
+    client_nom = serializers.CharField(source='client.nom', read_only=True)
+    created_by_email = serializers.CharField(
+        source='created_by.email', read_only=True)
+    lignes_vente = LigneDeVenteSerializer(many=True, read_only=True)
+    paiements = PaiementSerializer(many=True, read_only=True)
+    facture = FactureSerializer(read_only=True)
+    pourcentage_paye = serializers.SerializerMethodField()
+    jours_retard = serializers.SerializerMethodField()
+    statut_paiement_display = serializers.CharField(
+        source='get_statut_paiement_display', read_only=True)
+    mode_paiement_display = serializers.CharField(
+        source='get_mode_paiement_display', read_only=True)
+
+    # CORRECTION: Supprimer le paramètre source car le champ existe déjà dans le modèle
+    montant_avant_reduction = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True
+    )
+
+    # CORRECTION: Idem pour montant_reduction
+    montant_reduction_appliquee = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True
+    )
+
+    pourcentage_reduction_effectif = serializers.SerializerMethodField()
+
+    # Affichage type de réduction
+    type_reduction_display = serializers.CharField(
+        source='get_type_reduction_display',
+        read_only=True
+    )
+
+    class Meta:
+        model = Vente
+        fields = '__all__'
+        read_only_fields = ('created_by', 'created_at', 'numero_vente')
+
+    def get_pourcentage_paye(self, obj):
+        return obj.pourcentage_paye()
+
+    def get_jours_retard(self, obj):
+        return obj.jours_retard()
+
+    def get_pourcentage_reduction_effectif(self, obj):
+        return obj.pourcentage_reduction
 
 
 class EnregistrerPaiementSerializer(serializers.Serializer):
