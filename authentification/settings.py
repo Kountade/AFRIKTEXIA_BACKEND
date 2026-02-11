@@ -66,7 +66,7 @@ MIDDLEWARE = [
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOWED_ORIGINS = [
     "http://192.168.0.161:3000",
-    "https://afriktexia-backend.onrender.com",
+    "https://afriktexia-backend.onrender.com", "https://afriktexia-backend-nnp8.onrender.com",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
@@ -83,7 +83,7 @@ ROOT_URLCONF = "authentification.urls"
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-       'DIRS': [BASE_DIR/"templates"],
+        'DIRS': [BASE_DIR/"templates"],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -163,8 +163,10 @@ USE_TZ = True
 
 
 STATIC_URL = '/static/'
-STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static')]  # Dossier pour les fichiers statiques en développement
-STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')  # Dossier pour collectstatic
+# Dossier pour les fichiers statiques en développement
+STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static')]
+# Dossier pour collectstatic
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
 # Configuration WhiteNoise
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
