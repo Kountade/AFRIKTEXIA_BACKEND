@@ -27,10 +27,10 @@ SECRET_KEY = "django-insecure-9ftnoe#sy3po^#^06+-!--y4_8ek%ki_zc)tr35f2luccblvz4
 DEBUG = True
 
 
-ALLOWED_HOSTS = ["afriktexia-backend.onrender.com", "afriktexia-backend-nnp8.onrender.com",
+ALLOWED_HOSTS = ["afriktexia-backend-qhgj.onrender.com",
                  "localhost", "127.0.0.1"]
-CSRF_TRUSTED_ORIGINS = ['https://afriktexia-backend.onrender.com',
-                        'https://afriktexia-backend-nnp8.onrender.com',]
+CSRF_TRUSTED_ORIGINS = ['https://afriktexia-backend-qhgj.onrender.com',
+                        'https://afriktexia-backend-qhgj.onrender.com',]
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 
