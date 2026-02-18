@@ -248,6 +248,13 @@ class LigneDeVenteSerializer(serializers.ModelSerializer):
 
 class VenteSerializer(serializers.ModelSerializer):
     client_nom = serializers.CharField(source='client.nom', read_only=True)
+    client_numero = serializers.CharField(
+        source='client.numero_client', read_only=True)  # AJOUT
+    client_adresse = serializers.CharField(
+        source='client.adresse', read_only=True)
+    client_telephone = serializers.CharField(
+        source='client.telephone', read_only=True)
+    client_email = serializers.CharField(source='client.email', read_only=True)
     created_by_email = serializers.CharField(
         source='created_by.email', read_only=True)
     lignes_vente = LigneDeVenteSerializer(many=True, read_only=True)
@@ -365,25 +372,28 @@ class VenteCreateSerializer(serializers.ModelSerializer):
 
         if not user or not user.is_authenticated:
             raise serializers.ValidationError({
-                'non_field_errors': 'Utilisateur non authentiqué'
+                'non_field_errors': 'Utilisateur non authentifié'
             })
 
-        # Générer numéro de vente
-        today = datetime.now().strftime('%Y%m%d')
-        last_vente_today = Vente.objects.filter(
-            numero_vente__startswith=f'V{today}'
-        ).order_by('-numero_vente').first()
+        # MODIFICATION : Générer numéro de vente au format DA + 8 chiffres
+        # Récupérer la dernière vente pour déterminer le prochain numéro
+        last_vente = Vente.objects.order_by('-id').first()
 
-        if last_vente_today:
+        if last_vente and last_vente.numero_vente and last_vente.numero_vente.startswith('DA'):
             try:
-                last_number = int(last_vente_today.numero_vente[-4:])
+                # Extraire la partie numérique après 'DA'
+                last_number_str = last_vente.numero_vente[2:]  # Enlever 'DA'
+                last_number = int(last_number_str)
                 new_number = last_number + 1
             except (ValueError, IndexError):
-                new_number = 1
+                # En cas d'erreur, commencer à 100
+                new_number = 100
         else:
-            new_number = 1
+            # Commencer à 100 s'il n'y a pas de vente précédente au format DA
+            new_number = 100
 
-        numero_vente = f'V{today}{new_number:04d}'
+        # Formater avec 8 chiffres (00000100, 00000101, etc.)
+        numero_vente = f'DA{new_number:08d}'
 
         # Créer la vente avec les données de réduction
         vente = Vente.objects.create(
@@ -611,6 +621,7 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
 
 class VenteDetailSerializer(serializers.ModelSerializer):
     client_nom = serializers.CharField(source='client.nom', read_only=True)
+    client_numero = serializers.CharField(source='client.numero_client', read_only=True)  # AJOUT IC
     created_by_email = serializers.CharField(
         source='created_by.email', read_only=True)
     lignes_vente = LigneDeVenteSerializer(many=True, read_only=True)

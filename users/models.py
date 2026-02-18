@@ -163,6 +163,9 @@ class Client(models.Model):
     )
 
     nom = models.CharField(max_length=200)
+    # AJOUT : Numéro client unique
+    numero_client = models.CharField(
+        max_length=50, unique=True, blank=True, null=True)
     type_client = models.CharField(
         max_length=20, choices=TYPE_CLIENT_CHOICES, default='particulier')
     telephone = models.CharField(max_length=20)
@@ -175,8 +178,29 @@ class Client(models.Model):
     class Meta:
         ordering = ['-created_at']
 
+    def save(self, *args, **kwargs):
+        # Générer le numéro client si non existant
+        if not self.numero_client:
+            # Récupérer le dernier client pour déterminer le prochain numéro
+            last_client = Client.objects.order_by('-id').first()
+
+            if last_client and last_client.numero_client and last_client.numero_client.startswith('CLT'):
+                try:
+                    # Enlever 'CLT'
+                    last_number_str = last_client.numero_client[3:]
+                    last_number = int(last_number_str)
+                    new_number = last_number + 1
+                except (ValueError, IndexError):
+                    new_number = 100
+            else:
+                new_number = 100
+
+            self.numero_client = f'CLT{new_number:08d}'
+
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        return self.nom
+        return f"{self.nom} ({self.numero_client})"
 
 
 class Entrepot(models.Model):
