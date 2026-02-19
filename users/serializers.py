@@ -621,7 +621,8 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
 
 class VenteDetailSerializer(serializers.ModelSerializer):
     client_nom = serializers.CharField(source='client.nom', read_only=True)
-    client_numero = serializers.CharField(source='client.numero_client', read_only=True)  # AJOUT IC
+    client_numero = serializers.CharField(
+        source='client.numero_client', read_only=True)  # AJOUT IC
     created_by_email = serializers.CharField(
         source='created_by.email', read_only=True)
     lignes_vente = LigneDeVenteSerializer(many=True, read_only=True)
