@@ -104,24 +104,19 @@ class ProduitSerializer(serializers.ModelSerializer):
         return obj.stock_actuel()
 
     def get_stock_total(self, obj):
-        """Stock total dans tous les entrepôts"""
         total = StockEntrepot.objects.filter(produit=obj).aggregate(
             total=Sum('quantite')
         )['total'] or 0
-        return total
+        return float(total)
 
     def get_stock_reserve_total(self, obj):
-        """Stock réservé total dans tous les entrepôts"""
         total = StockEntrepot.objects.filter(produit=obj).aggregate(
             total=Sum('quantite_reservee')
         )['total'] or 0
-        return total
+        return float(total)
 
     def get_stock_disponible_total(self, obj):
-        """Stock disponible total dans tous les entrepôts"""
-        total_stock = self.get_stock_total(obj)
-        total_reserve = self.get_stock_reserve_total(obj)
-        return total_stock - total_reserve
+        return float(self.get_stock_total(obj) - self.get_stock_reserve_total(obj))
 
     def get_en_rupture(self, obj):
         return obj.en_rupture
@@ -198,9 +193,8 @@ class StockEntrepotSerializer(serializers.ModelSerializer):
     quantite_disponible = serializers.ReadOnlyField()
     en_rupture = serializers.ReadOnlyField()
     stock_faible = serializers.ReadOnlyField()
-    stock_total = serializers.IntegerField(source='quantite', read_only=True)
-    stock_reserve = serializers.IntegerField(
-        source='quantite_reservee', read_only=True)
+    stock_total = serializers.DecimalField(source='quantite', max_digits=10, decimal_places=2, read_only=True)  # MODIFICATION
+    stock_reserve = serializers.DecimalField(source='quantite_reservee', max_digits=10, decimal_places=2, read_only=True)  # MODIFICATION
 
     class Meta:
         model = StockEntrepot
@@ -224,6 +218,8 @@ class StockDetailSerializer(serializers.ModelSerializer):
 
 
 class LigneDeVenteCreateSerializer(serializers.ModelSerializer):
+    quantite = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0.01)  # MODIFICATION
+
     class Meta:
         model = LigneDeVente
         fields = ('produit', 'entrepot', 'quantite', 'prix_unitaire')
@@ -249,7 +245,7 @@ class LigneDeVenteSerializer(serializers.ModelSerializer):
 class VenteSerializer(serializers.ModelSerializer):
     client_nom = serializers.CharField(source='client.nom', read_only=True)
     client_numero = serializers.CharField(
-        source='client.numero_client', read_only=True)  # AJOUT
+        source='client.numero_client', read_only=True)
     client_adresse = serializers.CharField(
         source='client.adresse', read_only=True)
     client_telephone = serializers.CharField(
@@ -312,9 +308,8 @@ class VenteCreateSerializer(serializers.ModelSerializer):
         }
 
     def validate(self, data):
-        # Validation pour les réductions
         type_reduction = data.get('type_reduction', 'aucune')
-        valeur_reduction = data.get('valeur_reduction', 0)
+        valeur_reduction = float(data.get('valeur_reduction', 0))
 
         if type_reduction != 'aucune' and valeur_reduction <= 0:
             raise serializers.ValidationError({
@@ -326,7 +321,6 @@ class VenteCreateSerializer(serializers.ModelSerializer):
                 'valeur_reduction': 'Le pourcentage de réduction ne peut pas dépasser 100%'
             })
 
-        # Validation des lignes
         lignes_data = data.get('lignes_vente')
         if not lignes_data or len(lignes_data) == 0:
             raise serializers.ValidationError(
@@ -336,14 +330,13 @@ class VenteCreateSerializer(serializers.ModelSerializer):
         for ligne in lignes_data:
             produit = ligne.get('produit')
             entrepot = ligne.get('entrepot')
-            quantite = ligne.get('quantite')
+            quantite = float(ligne.get('quantite', 0))  # MODIFICATION: convertir en float
 
             if not produit or not entrepot or not quantite or quantite <= 0:
                 raise serializers.ValidationError(
                     "Chaque ligne doit avoir un produit, un entrepôt et une quantité positive."
                 )
 
-            # Vérifier le stock disponible
             try:
                 stock_entrepot = StockEntrepot.objects.get(
                     produit=produit,
@@ -352,7 +345,7 @@ class VenteCreateSerializer(serializers.ModelSerializer):
                 disponible = stock_entrepot.quantite_disponible
                 if quantite > disponible:
                     raise serializers.ValidationError(
-                        f"Stock insuffisant pour {produit.nom} dans {entrepot.nom}. Disponible: {disponible}"
+                        f"Stock insuffisant pour {produit.nom} dans {entrepot.nom}. Disponible: {disponible:.2f}"
                     )
             except StockEntrepot.DoesNotExist:
                 raise serializers.ValidationError(
@@ -363,39 +356,26 @@ class VenteCreateSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
-        """Création de vente avec réduction générale"""
         lignes_data = validated_data.pop('lignes_vente')
-
-        # Récupérer l'utilisateur depuis le contexte
-        user = self.context.get(
-            'request').user if self.context.get('request') else None
+        user = self.context.get('request').user if self.context.get('request') else None
 
         if not user or not user.is_authenticated:
             raise serializers.ValidationError({
                 'non_field_errors': 'Utilisateur non authentifié'
             })
 
-        # MODIFICATION : Générer numéro de vente au format DA + 8 chiffres
-        # Récupérer la dernière vente pour déterminer le prochain numéro
         last_vente = Vente.objects.order_by('-id').first()
-
         if last_vente and last_vente.numero_vente and last_vente.numero_vente.startswith('DA'):
             try:
-                # Extraire la partie numérique après 'DA'
-                last_number_str = last_vente.numero_vente[2:]  # Enlever 'DA'
+                last_number_str = last_vente.numero_vente[2:]
                 last_number = int(last_number_str)
                 new_number = last_number + 1
             except (ValueError, IndexError):
-                # En cas d'erreur, commencer à 100
                 new_number = 100
         else:
-            # Commencer à 100 s'il n'y a pas de vente précédente au format DA
             new_number = 100
-
-        # Formater avec 8 chiffres (00000100, 00000101, etc.)
         numero_vente = f'DA{new_number:08d}'
 
-        # Créer la vente avec les données de réduction
         vente = Vente.objects.create(
             numero_vente=numero_vente,
             client=validated_data.get('client'),
@@ -409,7 +389,6 @@ class VenteCreateSerializer(serializers.ModelSerializer):
             created_by=user
         )
 
-        # Créer les lignes de vente
         entrepots_utilises = set()
         montant_total_lignes = 0
 
@@ -419,7 +398,6 @@ class VenteCreateSerializer(serializers.ModelSerializer):
             quantite = ligne_data.get('quantite')
             type_vente = validated_data.get('type_vente', 'detail')
 
-            # Déterminer le prix selon type de vente
             if type_vente == 'gros':
                 prix_unitaire = produit.prix_vente_gros or produit.prix_vente or 0
                 est_prix_gros = True
@@ -427,7 +405,6 @@ class VenteCreateSerializer(serializers.ModelSerializer):
                 prix_unitaire = produit.prix_vente_detail or produit.prix_vente or 0
                 est_prix_gros = False
 
-            # Créer la ligne
             ligne = LigneDeVente.objects.create(
                 vente=vente,
                 produit=produit,
@@ -437,55 +414,44 @@ class VenteCreateSerializer(serializers.ModelSerializer):
                 est_prix_gros=est_prix_gros
             )
 
-            # Calculer le sous-total
-            sous_total = quantite * prix_unitaire
+            sous_total = float(quantite) * float(prix_unitaire)  # MODIFICATION
             ligne.montant_total = sous_total
             ligne.save()
 
             montant_total_lignes += sous_total
             entrepots_utilises.add(entrepot)
 
-        # Ajouter les entrepôts à la vente
         vente.entrepots.set(entrepots_utilises)
 
-        # Calculer la réduction générale
         type_reduction = validated_data.get('type_reduction', 'aucune')
-        valeur_reduction = validated_data.get('valeur_reduction', 0)
+        valeur_reduction = float(validated_data.get('valeur_reduction', 0))
 
         montant_reduction = 0
         if type_reduction != 'aucune' and valeur_reduction > 0:
             if type_reduction == 'pourcentage':
-                montant_reduction = (
-                    montant_total_lignes * valeur_reduction) / 100
-            else:  # Montant fixe
+                montant_reduction = (montant_total_lignes * valeur_reduction) / 100
+            else:
                 montant_reduction = valeur_reduction
-
-            # Limiter la réduction au montant total
             if montant_reduction > montant_total_lignes:
                 montant_reduction = montant_total_lignes
 
         montant_total_apres_reduction = montant_total_lignes - montant_reduction
 
-        # Mettre à jour la vente avec les montants calculés
         vente.montant_avant_reduction = montant_total_lignes
         vente.montant_reduction = montant_reduction
         vente.montant_total = montant_total_apres_reduction
         vente.montant_remise = montant_reduction
-        vente.montant_restant = max(
-            0, montant_total_apres_reduction - vente.montant_paye
-        )
+        vente.montant_restant = max(0, montant_total_apres_reduction - float(vente.montant_paye))
 
-        # Déterminer statut paiement
-        if vente.montant_paye >= montant_total_apres_reduction:
+        if float(vente.montant_paye) >= montant_total_apres_reduction:
             vente.statut_paiement = 'paye'
-        elif vente.montant_paye > 0:
+        elif float(vente.montant_paye) > 0:
             vente.statut_paiement = 'partiel'
         else:
             vente.statut_paiement = 'non_paye'
 
         vente.save()
 
-        # Audit log
         try:
             AuditLog.objects.create(
                 user=user,
@@ -523,22 +489,19 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
 
     def validate(self, data):
         vente = self.instance
-
         if vente.statut not in ['brouillon']:
             raise serializers.ValidationError(
                 "Seules les ventes en brouillon peuvent être modifiées"
             )
 
-        # Validation pour les réductions
         type_reduction = data.get('type_reduction')
-        valeur_reduction = data.get('valeur_reduction')
+        valeur_reduction = float(data.get('valeur_reduction') if data.get('valeur_reduction') is not None else 0)  # MODIFICATION
 
         if type_reduction and type_reduction != 'aucune':
             if not valeur_reduction or valeur_reduction <= 0:
                 raise serializers.ValidationError({
                     'valeur_reduction': 'La valeur de réduction doit être positive'
                 })
-
             if type_reduction == 'pourcentage' and valeur_reduction > 100:
                 raise serializers.ValidationError({
                     'valeur_reduction': 'Le pourcentage de réduction ne peut pas dépasser 100%'
@@ -554,14 +517,14 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
             for ligne in lignes_data:
                 produit = ligne.get('produit')
                 entrepot = ligne.get('entrepot')
-                quantite = ligne.get('quantite')
+                quantite = float(ligne.get('quantite', 0))  # MODIFICATION
 
                 if not produit or not entrepot or not quantite or quantite <= 0:
                     raise serializers.ValidationError(
                         "Chaque ligne doit avoir un produit, un entrepôt et une quantité positive."
                     )
 
-                if not ligne.get('prix_unitaire') or ligne['prix_unitaire'] <= 0:
+                if not ligne.get('prix_unitaire') or float(ligne['prix_unitaire']) <= 0:
                     raise serializers.ValidationError(
                         "Le prix unitaire doit être positif."
                     )
@@ -573,7 +536,7 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
                     )
                     if quantite > stock_entrepot.quantite_disponible:
                         raise serializers.ValidationError({
-                            'lignes_vente': f'Stock insuffisant pour {produit.nom} dans {entrepot.nom}. Disponible: {stock_entrepot.quantite_disponible}'
+                            'lignes_vente': f'Stock insuffisant pour {produit.nom} dans {entrepot.nom}. Disponible: {stock_entrepot.quantite_disponible:.2f}'
                         })
                 except StockEntrepot.DoesNotExist:
                     raise serializers.ValidationError({
@@ -586,33 +549,24 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         lignes_data = validated_data.pop('lignes_vente', None)
 
-        # Mettre à jour les champs de réduction
         if 'type_reduction' in validated_data:
             instance.type_reduction = validated_data['type_reduction']
         if 'valeur_reduction' in validated_data:
             instance.valeur_reduction = validated_data['valeur_reduction']
 
-        # Mettre à jour les autres champs
         for attr, value in validated_data.items():
             if attr not in ['type_reduction', 'valeur_reduction']:
                 setattr(instance, attr, value)
 
-        # Si des lignes sont fournies, les mettre à jour
         if lignes_data:
-            # Supprimer les anciennes lignes
             instance.lignes_vente.all().delete()
-
-            # Créer les nouvelles lignes
             entrepots_utilises = set()
             for ligne_data in lignes_data:
                 ligne = LigneDeVente.objects.create(
                     vente=instance, **ligne_data)
                 entrepots_utilises.add(ligne.entrepot)
-
-            # Mettre à jour les entrepôts
             instance.entrepots.set(entrepots_utilises)
 
-        # Recalculer les totaux avec la réduction
         instance.calculer_total()
         instance.save()
 
@@ -622,7 +576,7 @@ class VenteUpdateSerializer(serializers.ModelSerializer):
 class VenteDetailSerializer(serializers.ModelSerializer):
     client_nom = serializers.CharField(source='client.nom', read_only=True)
     client_numero = serializers.CharField(
-        source='client.numero_client', read_only=True)  # AJOUT IC
+        source='client.numero_client', read_only=True)
     created_by_email = serializers.CharField(
         source='created_by.email', read_only=True)
     lignes_vente = LigneDeVenteSerializer(many=True, read_only=True)
@@ -634,28 +588,13 @@ class VenteDetailSerializer(serializers.ModelSerializer):
         source='get_statut_paiement_display', read_only=True)
     mode_paiement_display = serializers.CharField(
         source='get_mode_paiement_display', read_only=True)
-
-    # CORRECTION: Supprimer le paramètre source car le champ existe déjà dans le modèle
     montant_avant_reduction = serializers.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        read_only=True
-    )
-
-    # CORRECTION: Idem pour montant_reduction
+        max_digits=12, decimal_places=2, read_only=True)
     montant_reduction_appliquee = serializers.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        read_only=True
-    )
-
+        max_digits=12, decimal_places=2, read_only=True)
     pourcentage_reduction_effectif = serializers.SerializerMethodField()
-
-    # Affichage type de réduction
     type_reduction_display = serializers.CharField(
-        source='get_type_reduction_display',
-        read_only=True
-    )
+        source='get_type_reduction_display', read_only=True)
 
     class Meta:
         model = Vente
@@ -684,17 +623,17 @@ class EnregistrerPaiementSerializer(serializers.Serializer):
 
     def validate(self, data):
         vente = self.context['vente']
-        montant = data['montant']
+        montant = float(data['montant'])
 
         if montant <= 0:
             raise serializers.ValidationError({
                 'montant': 'Le montant doit être supérieur à 0'
             })
 
-        montant_restant = vente.montant_restant
+        montant_restant = float(vente.montant_restant)
         if montant > montant_restant:
             raise serializers.ValidationError({
-                'montant': f"Le montant ({montant}) dépasse le montant restant ({montant_restant})"
+                'montant': f"Le montant ({montant}) dépasse le montant restant ({montant_restant:.2f})"
             })
 
         if vente.statut != 'confirmee':
@@ -721,6 +660,8 @@ class LigneTransfertSerializer(serializers.ModelSerializer):
 
 
 class LigneTransfertCreateSerializer(serializers.ModelSerializer):
+    quantite = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0.01)  # MODIFICATION
+
     class Meta:
         model = LigneTransfert
         fields = ('produit', 'quantite')
@@ -742,7 +683,7 @@ class TransfertEntrepotSerializer(serializers.ModelSerializer):
         read_only_fields = ('created_by', 'created_at', 'reference')
 
     def get_total_quantite(self, obj):
-        return sum(ligne.quantite for ligne in obj.lignes_transfert.all())
+        return sum(float(ligne.quantite) for ligne in obj.lignes_transfert.all())
 
 
 class TransfertEntrepotCreateSerializer(serializers.ModelSerializer):
@@ -767,7 +708,7 @@ class TransfertEntrepotCreateSerializer(serializers.ModelSerializer):
 
         for ligne in data['lignes_transfert']:
             produit = ligne['produit']
-            quantite = ligne['quantite']
+            quantite = float(ligne['quantite'])  # MODIFICATION
 
             if quantite <= 0:
                 raise serializers.ValidationError({
@@ -782,7 +723,7 @@ class TransfertEntrepotCreateSerializer(serializers.ModelSerializer):
 
                 if quantite > stock_source.quantite_disponible:
                     raise serializers.ValidationError({
-                        'lignes_transfert': f"Stock insuffisant pour {produit.nom}. Disponible: {stock_source.quantite_disponible}"
+                        'lignes_transfert': f"Stock insuffisant pour {produit.nom}. Disponible: {stock_source.quantite_disponible:.2f}"
                     })
 
             except StockEntrepot.DoesNotExist:
@@ -795,7 +736,6 @@ class TransfertEntrepotCreateSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def create(self, validated_data):
         lignes_data = validated_data.pop('lignes_transfert')
-
         today = datetime.now().strftime('%Y%m%d')
         last_transfert_today = TransfertEntrepot.objects.filter(
             created_at__date=timezone.now().date()
@@ -854,4 +794,4 @@ class AuditLogSerializer(serializers.ModelSerializer):
 class StockVerificationSerializer(serializers.Serializer):
     produit_id = serializers.IntegerField(required=True)
     entrepot_id = serializers.IntegerField(required=True)
-    quantite = serializers.IntegerField(required=True, min_value=1)
+    quantite = serializers.DecimalField(required=True, min_value=0.01, max_digits=10, decimal_places=2)  # MODIFICATION

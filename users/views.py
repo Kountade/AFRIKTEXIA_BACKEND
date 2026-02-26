@@ -5,7 +5,7 @@ from rest_framework.decorators import action
 from django.contrib.auth import get_user_model, authenticate
 from knox.models import AuthToken
 from django.db import transaction
-from django.db.models import Sum, Q, Count
+from django.db.models import Sum, Q, Count, F
 from datetime import datetime, timedelta
 from django.http import HttpResponse
 import csv
@@ -286,15 +286,14 @@ class StockEntrepotViewSet(viewsets.ModelViewSet):
         low_stock = self.request.query_params.get('low_stock')
         if low_stock:
             queryset = queryset.filter(
-                quantite__gt=models.F('quantite_reservee'),
-                quantite__lte=models.F(
-                    'quantite_reservee') + models.F('stock_alerte')
+                quantite__gt=F('quantite_reservee'),
+                quantite__lte=F('quantite_reservee') + F('stock_alerte')
             )
 
         out_of_stock = self.request.query_params.get('out_of_stock')
         if out_of_stock:
             queryset = queryset.filter(
-                quantite__lte=models.F('quantite_reservee')
+                quantite__lte=F('quantite_reservee')
             )
 
         return queryset
@@ -315,10 +314,10 @@ class StockEntrepotViewSet(viewsets.ModelViewSet):
             produit_stocks = stocks.filter(produit_id=produit_id)
             produit = Produit.objects.get(id=produit_id)
 
-            total_quantite = produit_stocks.aggregate(
-                Sum('quantite'))['quantite__sum'] or 0
-            total_reservee = produit_stocks.aggregate(Sum('quantite_reservee'))[
-                'quantite_reservee__sum'] or 0
+            total_quantite = float(produit_stocks.aggregate(
+                Sum('quantite'))['quantite__sum'] or 0)
+            total_reservee = float(produit_stocks.aggregate(
+                Sum('quantite_reservee'))['quantite_reservee__sum'] or 0)
 
             data.append({
                 'produit_id': produit_id,
@@ -356,10 +355,12 @@ class StockDisponibleViewSet(viewsets.ViewSet):
             data.append({
                 'entrepot_id': stock.entrepot.id,
                 'entrepot_nom': stock.entrepot.nom,
-                'quantite_disponible': stock.quantite_disponible,
-                'quantite_totale': stock.quantite,
-                'quantite_reservee': stock.quantite_reservee,
-                'stock_alerte': stock.stock_alerte,
+                # MODIFICATION
+                'quantite_disponible': float(stock.quantite_disponible),
+                'quantite_totale': float(stock.quantite),  # MODIFICATION
+                # MODIFICATION
+                'quantite_reservee': float(stock.quantite_reservee),
+                'stock_alerte': float(stock.stock_alerte),  # MODIFICATION
                 'en_rupture': stock.en_rupture,
                 'stock_faible': stock.stock_faible
             })
@@ -420,23 +421,26 @@ class StockVerificationViewSet(viewsets.ViewSet):
                 )
 
                 disponible = stock.quantite_disponible
-                suffisant = disponible >= data['quantite']
+                suffisant = disponible >= float(
+                    data['quantite'])  # MODIFICATION
 
                 return Response({
                     'suffisant': suffisant,
                     'quantite_disponible': disponible,
-                    'quantite_demandee': data['quantite'],
-                    'quantite_totale': stock.quantite,
-                    'quantite_reservee': stock.quantite_reservee,
-                    'stock_alerte': stock.stock_alerte,
-                    'message': f'Stock {"suffisant" if suffisant else "insuffisant"}: {disponible} unités disponibles' if suffisant else f'Stock insuffisant: {disponible} unités disponibles, besoin: {data["quantite"]}'
+                    # MODIFICATION
+                    'quantite_demandee': float(data['quantite']),
+                    'quantite_totale': float(stock.quantite),
+                    'quantite_reservee': float(stock.quantite_reservee),
+                    'stock_alerte': float(stock.stock_alerte),
+                    'message': f'Stock {"suffisant" if suffisant else "insuffisant"}: {disponible:.2f} unités disponibles' if suffisant else f'Stock insuffisant: {disponible:.2f} unités disponibles, besoin: {float(data["quantite"]):.2f}'
                 })
 
             except StockEntrepot.DoesNotExist:
                 return Response({
                     'suffisant': False,
                     'quantite_disponible': 0,
-                    'quantite_demandee': data['quantite'],
+                    # MODIFICATION
+                    'quantite_demandee': float(data['quantite']),
                     'message': 'Produit non disponible dans cet entrepôt'
                 }, status=404)
 
@@ -481,7 +485,7 @@ class TransfertEntrepotViewSet(viewsets.ModelViewSet):
                         entrepot=transfert.entrepot_source
                     )
 
-                    if ligne.quantite > stock_source.quantite_disponible:
+                    if float(ligne.quantite) > stock_source.quantite_disponible:  # MODIFICATION
                         return Response(
                             {"detail": f"Stock insuffisant pour {ligne.produit.nom}."},
                             status=status.HTTP_400_BAD_REQUEST
@@ -546,7 +550,6 @@ class VenteViewSet(viewsets.ModelViewSet):
         user = self.request.user
         queryset = Vente.objects.all().order_by('-created_at')
 
-        # Filtres existants...
         statut = self.request.query_params.get('statut')
         if statut:
             queryset = queryset.filter(statut=statut)
@@ -582,7 +585,6 @@ class VenteViewSet(viewsets.ModelViewSet):
                 statut_paiement__in=['non_paye', 'partiel']
             )
 
-        # Filtre par utilisateur si pas admin
         if user.role != 'admin':
             queryset = queryset.filter(created_by=user)
 
@@ -601,18 +603,14 @@ class VenteViewSet(viewsets.ModelViewSet):
         serializer.save(created_by=self.request.user)
 
     def create(self, request, *args, **kwargs):
-        """Création d'une vente avec réduction générale"""
         try:
             with transaction.atomic():
-                # Valider et créer la vente via serializer
                 serializer = self.get_serializer(data=request.data)
                 serializer.is_valid(raise_exception=True)
 
-                # Sauvegarder la vente
                 self.perform_create(serializer)
                 vente = serializer.instance
 
-                # Réserver le stock
                 stocks_reserves = []
                 for ligne in vente.lignes_vente.all():
                     try:
@@ -621,24 +619,29 @@ class VenteViewSet(viewsets.ModelViewSet):
                             entrepot=ligne.entrepot
                         )
 
-                        stock_disponible = stock_entrepot.quantite - stock_entrepot.quantite_reservee
+                        stock_disponible = stock_entrepot.quantite_disponible
 
-                        if ligne.quantite > stock_disponible:
+                        if float(ligne.quantite) > stock_disponible:  # MODIFICATION
                             raise serializers.ValidationError({
-                                'lignes_vente': f'Stock insuffisant pour {ligne.produit.nom} dans {ligne.entrepot.nom}. Disponible: {stock_disponible}'
+                                'lignes_vente': f'Stock insuffisant pour {ligne.produit.nom} dans {ligne.entrepot.nom}. Disponible: {stock_disponible:.2f}'
                             })
 
-                        ancienne_reserve = stock_entrepot.quantite_reservee
-                        stock_entrepot.quantite_reservee += ligne.quantite
+                        ancienne_reserve = float(
+                            stock_entrepot.quantite_reservee)  # MODIFICATION
+                        stock_entrepot.quantite_reservee = F(
+                            'quantite_reservee') + ligne.quantite
                         stock_entrepot.save()
+                        stock_entrepot.refresh_from_db()
 
                         stocks_reserves.append({
                             'produit': ligne.produit.nom,
                             'entrepot': ligne.entrepot.nom,
-                            'quantite': ligne.quantite,
+                            'quantite': float(ligne.quantite),  # MODIFICATION
                             'ancienne_reserve': ancienne_reserve,
-                            'nouvelle_reserve': stock_entrepot.quantite_reservee,
-                            'stock_total': stock_entrepot.quantite
+                            # MODIFICATION
+                            'nouvelle_reserve': float(stock_entrepot.quantite_reservee),
+                            # MODIFICATION
+                            'stock_total': float(stock_entrepot.quantite)
                         })
 
                     except StockEntrepot.DoesNotExist:
@@ -646,7 +649,6 @@ class VenteViewSet(viewsets.ModelViewSet):
                             'lignes_vente': f'Stock non trouvé pour {ligne.produit.nom} dans {ligne.entrepot.nom}'
                         })
 
-                # Log d'audit
                 AuditLog.objects.create(
                     user=request.user,
                     action='creation',
@@ -663,7 +665,6 @@ class VenteViewSet(viewsets.ModelViewSet):
                     }
                 )
 
-                # Retourner la réponse
                 response_serializer = VenteDetailSerializer(vente)
 
                 return Response(
@@ -672,10 +673,10 @@ class VenteViewSet(viewsets.ModelViewSet):
                         'vente': response_serializer.data,
                         'reduction_info': {
                             'type': vente.type_reduction,
-                            'valeur': vente.valeur_reduction,
-                            'montant': vente.montant_reduction,
-                            'montant_avant_reduction': vente.montant_avant_reduction,
-                            'montant_apres_reduction': vente.montant_total
+                            'valeur': float(vente.valeur_reduction),
+                            'montant': float(vente.montant_reduction),
+                            'montant_avant_reduction': float(vente.montant_avant_reduction),
+                            'montant_apres_reduction': float(vente.montant_total)
                         },
                         'stocks_reserves': stocks_reserves
                     },
@@ -694,38 +695,31 @@ class VenteViewSet(viewsets.ModelViewSet):
             )
 
     def update(self, request, *args, **kwargs):
-        """
-        Mise à jour d'une vente avec ajustement des réductions
-        """
         try:
             with transaction.atomic():
                 instance = self.get_object()
 
-                # Vérifier les permissions
                 if request.user.role != 'admin' and instance.created_by != request.user:
                     return Response(
                         {"error": "Vous ne pouvez modifier que vos propres ventes"},
                         status=status.HTTP_403_FORBIDDEN
                     )
 
-                # Vérifier que la vente est en brouillon
                 if instance.statut != 'brouillon':
                     return Response(
                         {"error": "Impossible de modifier une vente confirmée"},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Sauvegarder les anciennes lignes
                 anciennes_lignes_dict = {}
                 for ligne in instance.lignes_vente.all():
                     key = (ligne.produit_id, ligne.entrepot_id)
                     anciennes_lignes_dict[key] = {
-                        'quantite': ligne.quantite,
-                        'stock_preleve': ligne.stock_preleve,
+                        'quantite': float(ligne.quantite),  # MODIFICATION
+                        'stock_preleve': ligne.stock_preleve if hasattr(ligne, 'stock_preleve') else False,
                         'id': ligne.id
                     }
 
-                # Mettre à jour la vente
                 serializer = self.get_serializer(
                     instance,
                     data=request.data,
@@ -733,7 +727,6 @@ class VenteViewSet(viewsets.ModelViewSet):
                 )
                 serializer.is_valid(raise_exception=True)
 
-                # Récupérer les nouvelles valeurs de réduction
                 nouvelle_reduction_type = request.data.get('type_reduction')
                 nouvelle_valeur_reduction = request.data.get(
                     'valeur_reduction')
@@ -744,27 +737,21 @@ class VenteViewSet(viewsets.ModelViewSet):
                     instance.valeur_reduction = nouvelle_valeur_reduction
 
                 self.perform_update(serializer)
-
-                # Sauvegarder pour calculer les nouveaux totaux
                 instance.save()
 
-                # ... (gestion des ajustements de stock inchangée) ...
-
-                # Informations sur la nouvelle réduction
                 reduction_info = {
                     'type': instance.type_reduction,
-                    'valeur': instance.valeur_reduction,
-                    'montant': instance.montant_reduction,
-                    'montant_avant_reduction': instance.montant_avant_reduction,
-                    'montant_apres_reduction': instance.montant_total,
-                    'pourcentage_effectif': instance.pourcentage_reduction
+                    'valeur': float(instance.valeur_reduction),
+                    'montant': float(instance.montant_reduction),
+                    'montant_avant_reduction': float(instance.montant_avant_reduction),
+                    'montant_apres_reduction': float(instance.montant_total),
+                    'pourcentage_effectif': float(instance.pourcentage_reduction)
                 }
 
                 return Response({
                     'message': 'Vente mise à jour avec succès',
                     'vente': serializer.data,
                     'reduction_info': reduction_info,
-                    # ... (autres informations) ...
                 })
 
         except serializers.ValidationError as e:
@@ -780,7 +767,6 @@ class VenteViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def confirmer(self, request, pk=None):
-        """Confirmer la vente"""
         try:
             with transaction.atomic():
                 vente = self.get_object()
@@ -797,7 +783,6 @@ class VenteViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # S'assurer que les totaux sont à jour
                 vente.calculer_total()
                 vente.save()
 
@@ -805,14 +790,13 @@ class VenteViewSet(viewsets.ModelViewSet):
 
                 vente.refresh_from_db()
 
-                # Informations sur la réduction
                 reduction_info = {
                     'type': vente.type_reduction,
-                    'valeur': vente.valeur_reduction,
-                    'montant': vente.montant_reduction,
-                    'montant_avant_reduction': vente.montant_avant_reduction,
-                    'montant_apres_reduction': vente.montant_total,
-                    'pourcentage_effectif': vente.pourcentage_reduction
+                    'valeur': float(vente.valeur_reduction),
+                    'montant': float(vente.montant_reduction),
+                    'montant_avant_reduction': float(vente.montant_avant_reduction),
+                    'montant_apres_reduction': float(vente.montant_total),
+                    'pourcentage_effectif': float(vente.pourcentage_reduction)
                 }
 
                 return Response({
@@ -830,7 +814,6 @@ class VenteViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def statistiques_reductions(self, request):
-        """Statistiques sur les réductions appliquées"""
         user = request.user
         date_debut = request.query_params.get('date_debut')
         date_fin = request.query_params.get('date_fin')
@@ -849,14 +832,12 @@ class VenteViewSet(viewsets.ModelViewSet):
                 created_at__date__lte=date_fin
             )
 
-        # Statistiques par type de réduction
         stats_par_type = queryset.values('type_reduction').annotate(
             nombre_ventes=Count('id'),
             total_reduction=Sum('montant_reduction'),
             total_ventes=Sum('montant_total')
         ).order_by('type_reduction')
 
-        # Top 10 ventes avec les plus grosses réductions
         top_reductions = queryset.filter(
             type_reduction__in=['pourcentage', 'montant']
         ).order_by('-montant_reduction')[:10]
@@ -868,28 +849,27 @@ class VenteViewSet(viewsets.ModelViewSet):
                 'numero_vente': vente.numero_vente,
                 'client': vente.client.nom if vente.client else 'N/A',
                 'type_reduction': vente.get_type_reduction_display(),
-                'valeur_reduction': vente.valeur_reduction,
-                'montant_reduction': vente.montant_reduction,
-                'montant_total': vente.montant_total,
+                'valeur_reduction': float(vente.valeur_reduction),
+                'montant_reduction': float(vente.montant_reduction),
+                'montant_total': float(vente.montant_total),
                 'date': vente.created_at.strftime('%d/%m/%Y')
             })
 
-        # Total des réductions
-        total_reductions = queryset.filter(
+        total_reductions = float(queryset.filter(
             type_reduction__in=['pourcentage', 'montant']
-        ).aggregate(total=Sum('montant_reduction'))['total'] or 0
+        ).aggregate(total=Sum('montant_reduction'))['total'] or 0)
 
-        total_ventes = queryset.aggregate(
-            total=Sum('montant_total'))['total'] or 0
+        total_ventes = float(queryset.aggregate(
+            total=Sum('montant_total'))['total'] or 0)
         total_avant_reduction = total_ventes + total_reductions
 
         return Response({
             'stats_par_type': list(stats_par_type),
             'top_reductions': top_reductions_data,
             'totaux': {
-                'total_reductions': float(total_reductions),
-                'total_ventes': float(total_ventes),
-                'total_avant_reduction': float(total_avant_reduction),
+                'total_reductions': total_reductions,
+                'total_ventes': total_ventes,
+                'total_avant_reduction': total_avant_reduction,
                 'pourcentage_moyen_reduction': (total_reductions / total_avant_reduction * 100)
                 if total_avant_reduction > 0 else 0
             }
@@ -915,10 +895,10 @@ class HistoriqueClientViewSet(viewsets.ViewSet):
             statut='confirmee'
         ).order_by('-created_at')
 
-        total_achats = ventes.aggregate(Sum('montant_total'))[
-            'montant_total__sum'] or 0
-        total_paye = ventes.aggregate(Sum('montant_paye'))[
-            'montant_paye__sum'] or 0
+        total_achats = float(ventes.aggregate(Sum('montant_total'))[
+                             'montant_total__sum'] or 0)
+        total_paye = float(ventes.aggregate(Sum('montant_paye'))[
+                           'montant_paye__sum'] or 0)
         ventes_en_retard = ventes.filter(
             date_echeance__lt=timezone.now().date(),
             statut_paiement__in=['non_paye', 'partiel']
@@ -989,12 +969,12 @@ class RapportPaiementsViewSet(viewsets.ViewSet):
             statut_paiement__in=['non_paye', 'partiel']
         )
 
-        total_impaye = ventes_impayees.aggregate(
+        total_impaye = float(ventes_impayees.aggregate(
             total=Sum('montant_restant')
-        )['total'] or 0
+        )['total'] or 0)
 
         return Response({
-            'total_paiements': paiements.aggregate(Sum('montant'))['montant__sum'] or 0,
+            'total_paiements': float(paiements.aggregate(Sum('montant'))['montant__sum'] or 0),
             'nombre_paiements': paiements.count(),
             'par_mode_paiement': list(par_mode),
             'par_jour': list(par_jour),
@@ -1027,8 +1007,8 @@ class DashboardViewSet(viewsets.ViewSet):
             entrepots_filter = Entrepot.objects.filter(actif=True)
 
         total_ventes = ventes_filter.count()
-        chiffre_affaires = ventes_filter.aggregate(Sum('montant_total'))[
-            'montant_total__sum'] or 0
+        chiffre_affaires = float(ventes_filter.aggregate(
+            Sum('montant_total'))['montant_total__sum'] or 0)
         total_clients = clients_filter.count()
         total_produits = Produit.objects.count()
         total_entrepots = entrepots_filter.count()
@@ -1041,22 +1021,21 @@ class DashboardViewSet(viewsets.ViewSet):
             entrepots_stocks.append({
                 'id': entrepot.id,
                 'nom': entrepot.nom,
-                'valeur_stock': float(valeur_stock),
+                'valeur_stock': valeur_stock,
                 'produits_count': entrepot.produits_count(),
                 'statut': 'actif' if entrepot.actif else 'inactif'
             })
 
-        ventes_mois = ventes_filter.filter(created_at__gte=month_start).aggregate(
-            Sum('montant_total'))['montant_total__sum'] or 0
+        ventes_mois = float(ventes_filter.filter(created_at__gte=month_start).aggregate(
+            Sum('montant_total'))['montant_total__sum'] or 0)
 
-        ventes_semaine = ventes_filter.filter(created_at__gte=week_start).aggregate(
-            Sum('montant_total'))['montant_total__sum'] or 0
+        ventes_semaine = float(ventes_filter.filter(created_at__gte=week_start).aggregate(
+            Sum('montant_total'))['montant_total__sum'] or 0)
 
         produits_low_stock = []
         stocks_faibles = StockEntrepot.objects.filter(
-            quantite__gt=models.F('quantite_reservee'),
-            quantite__lte=models.F('quantite_reservee') +
-            models.F('stock_alerte')
+            quantite__gt=F('quantite_reservee'),
+            quantite__lte=F('quantite_reservee') + F('stock_alerte')
         ).select_related('produit', 'entrepot')
 
         for stock in stocks_faibles[:10]:
@@ -1067,7 +1046,7 @@ class DashboardViewSet(viewsets.ViewSet):
                 'entrepot_id': stock.entrepot.id,
                 'entrepot_nom': stock.entrepot.nom,
                 'stock_actuel': stock.quantite_disponible,
-                'stock_alerte': stock.stock_alerte,
+                'stock_alerte': float(stock.stock_alerte),  # MODIFICATION
                 'statut': 'faible'
             })
 
@@ -1087,19 +1066,19 @@ class DashboardViewSet(viewsets.ViewSet):
             top_produits_data.append({
                 'id': produit.id,
                 'nom': produit.nom,
-                'total_vendu': produit.total_vendu or 0
+                'total_vendu': float(produit.total_vendu) if produit.total_vendu else 0
             })
 
         return Response({
             'stats': {
                 'total_ventes': total_ventes,
-                'chiffre_affaires': float(chiffre_affaires),
-                'chiffre_affaires_mois': float(ventes_mois),
-                'chiffre_affaires_semaine': float(ventes_semaine),
+                'chiffre_affaires': chiffre_affaires,
+                'chiffre_affaires_mois': ventes_mois,
+                'chiffre_affaires_semaine': ventes_semaine,
                 'total_clients': total_clients,
                 'total_produits': total_produits,
                 'total_entrepots': total_entrepots,
-                'valeur_stock_total': float(valeur_stock_total),
+                'valeur_stock_total': valeur_stock_total,
             },
             'entrepots': entrepots_stocks,
             'produits_low_stock': produits_low_stock,
@@ -1192,15 +1171,15 @@ class RapportsViewSet(viewsets.ViewSet):
 
         stats = {
             'total_ventes': queryset.count(),
-            'chiffre_affaires_total': queryset.aggregate(
+            'chiffre_affaires_total': float(queryset.aggregate(
                 total=Sum('montant_total')
-            )['total'] or 0,
+            )['total'] or 0),
             'clients_actifs': Client.objects.filter(
                 vente__in=queryset
             ).distinct().count(),
-            'total_produits_vendus': LigneDeVente.objects.filter(
+            'total_produits_vendus': float(LigneDeVente.objects.filter(
                 vente__in=queryset
-            ).aggregate(total=Sum('quantite'))['total'] or 0,
+            ).aggregate(total=Sum('quantite'))['total'] or 0),
         }
 
         if user.role == 'admin':
@@ -1231,7 +1210,7 @@ class RapportsViewSet(viewsets.ViewSet):
         stats['top_produit'] = {
             'id': top_produit.id if top_produit else None,
             'nom': top_produit.nom if top_produit else 'N/A',
-            'total_vendu': top_produit.total_vendu if top_produit else 0
+            'total_vendu': float(top_produit.total_vendu) if top_produit and top_produit.total_vendu else 0
         }
 
         top_entrepot = Entrepot.objects.filter(
@@ -1284,12 +1263,13 @@ class RapportsViewSet(viewsets.ViewSet):
                 'entrepot_id': stock.entrepot.id,
                 'entrepot_nom': stock.entrepot.nom,
                 'stock_actuel': stock.quantite_disponible,
-                'stock_total': stock.quantite,
-                'stock_reserve': stock.quantite_reservee,
-                'stock_alerte': stock.stock_alerte,
+                'stock_total': float(stock.quantite),  # MODIFICATION
+                # MODIFICATION
+                'stock_reserve': float(stock.quantite_reservee),
+                'stock_alerte': float(stock.stock_alerte),  # MODIFICATION
                 'statut': statut,
-                'prix_achat': stock.produit.prix_achat,
-                'prix_vente': stock.produit.prix_vente,
+                'prix_achat': float(stock.produit.prix_achat),
+                'prix_vente': float(stock.produit.prix_vente),
             })
 
         return Response({
@@ -1358,7 +1338,8 @@ class StockOperationsViewSet(viewsets.ViewSet):
                 queryset=Entrepot.objects.all())
             produit = serializers.PrimaryKeyRelatedField(
                 queryset=Produit.objects.all())
-            quantite = serializers.IntegerField(min_value=1)
+            quantite = serializers.DecimalField(
+                max_digits=10, decimal_places=2, min_value=0.01)  # MODIFICATION
             motif = serializers.CharField(max_length=500)
             type_ajustement = serializers.ChoiceField(
                 choices=['ajout', 'retrait'])
@@ -1375,14 +1356,15 @@ class StockOperationsViewSet(viewsets.ViewSet):
                     defaults={'quantite': 0}
                 )
 
-                ancienne_quantite = stock.quantite
+                ancienne_quantite = float(stock.quantite)  # MODIFICATION
 
                 if data['type_ajustement'] == 'ajout':
-                    stock.quantite += data['quantite']
+                    stock.quantite = F('quantite') + data['quantite']
                 else:
-                    stock.quantite = max(0, stock.quantite - data['quantite'])
+                    stock.quantite = F('quantite') - data['quantite']
 
                 stock.save()
+                stock.refresh_from_db()
 
                 MouvementStock.objects.create(
                     produit=data['produit'],
@@ -1403,7 +1385,8 @@ class StockOperationsViewSet(viewsets.ViewSet):
                         'entrepot': data['entrepot'].nom,
                         'produit': data['produit'].nom,
                         'ancienne_quantite': ancienne_quantite,
-                        'nouvelle_quantite': stock.quantite,
+                        # MODIFICATION
+                        'nouvelle_quantite': float(stock.quantite),
                         'motif': data['motif']
                     }
                 )
@@ -1411,7 +1394,7 @@ class StockOperationsViewSet(viewsets.ViewSet):
                 return Response({
                     'message': 'Stock ajusté avec succès',
                     'ancienne_quantite': ancienne_quantite,
-                    'nouvelle_quantite': stock.quantite
+                    'nouvelle_quantite': float(stock.quantite)  # MODIFICATION
                 })
 
             except Exception as e:
@@ -1421,7 +1404,6 @@ class StockOperationsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['post'])
     def liberer_stock_reserve(self, request):
-        """Libérer tout le stock réservé (pour debug)"""
         if not request.user.is_superuser:
             return Response({'error': 'Permission refusée'}, status=403)
 
@@ -1431,14 +1413,15 @@ class StockOperationsViewSet(viewsets.ViewSet):
                 total_liberes = 0
 
                 for stock in stocks:
-                    if stock.quantite_reservee > 0:
-                        ancienne_reserve = stock.quantite_reservee
+                    if float(stock.quantite_reservee) > 0:
+                        ancienne_reserve = float(
+                            stock.quantite_reservee)  # MODIFICATION
                         stock.quantite_reservee = 0
                         stock.save()
                         total_liberes += ancienne_reserve
 
                 return Response({
-                    'message': f'{total_liberes} unités de stock réservé libérées',
+                    'message': f'{total_liberes:.2f} unités de stock réservé libérées',
                     'total_liberes': total_liberes
                 })
         except Exception as e:
