@@ -298,9 +298,30 @@ class StockEntrepotViewSet(viewsets.ModelViewSet):
 
         return queryset
 
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+
+        # Sérialiser les données
+        serializer = self.get_serializer(queryset, many=True)
+        data = serializer.data
+
+        # Pour les vendeurs, masquer les informations de valeur
+        if request.user.role != 'admin':
+            for item in data:
+                # Supprimer les champs liés à la valeur
+                item.pop('prix_achat', None)
+                item.pop('prix_vente', None)
+                item.pop('prix_vente_gros', None)
+                item.pop('prix_vente_detail', None)
+                # Optionnel : ajouter un indicateur
+                item['valeur_masquee'] = True
+
+        return Response(data)
+
     @action(detail=False, methods=['get'])
     def stock_global(self, request):
         entrepot_id = request.query_params.get('entrepot')
+        user = request.user
 
         if entrepot_id:
             stocks = StockEntrepot.objects.filter(entrepot_id=entrepot_id)
@@ -309,6 +330,9 @@ class StockEntrepotViewSet(viewsets.ModelViewSet):
 
         data = []
         produits_ids = stocks.values_list('produit_id', flat=True).distinct()
+
+        # Variable pour stocker la valeur totale du stock (seulement pour admin)
+        valeur_stock_total = 0
 
         for produit_id in produits_ids:
             produit_stocks = stocks.filter(produit_id=produit_id)
@@ -319,7 +343,8 @@ class StockEntrepotViewSet(viewsets.ModelViewSet):
             total_reservee = float(produit_stocks.aggregate(
                 Sum('quantite_reservee'))['quantite_reservee__sum'] or 0)
 
-            data.append({
+            # Données de base (visibles par tous)
+            item = {
                 'produit_id': produit_id,
                 'produit_nom': produit.nom,
                 'produit_code': produit.code,
@@ -329,9 +354,47 @@ class StockEntrepotViewSet(viewsets.ModelViewSet):
                 'stocks_par_entrepot': StockEntrepotSerializer(
                     produit_stocks, many=True
                 ).data
-            })
+            }
 
-        return Response(data)
+            # Données financières (visibles seulement par les admins)
+            if user.role == 'admin':
+                # Calculer la valeur du stock pour ce produit
+                valeur_produit = 0
+                for stock in produit_stocks:
+                    valeur_produit += float(stock.quantite) * \
+                        float(produit.prix_achat)
+
+                valeur_stock_total += valeur_produit
+
+                item['prix_achat'] = float(produit.prix_achat)
+                item['prix_vente'] = float(produit.prix_vente)
+                item['prix_vente_gros'] = float(produit.prix_vente_gros or 0)
+                item['prix_vente_detail'] = float(
+                    produit.prix_vente_detail or 0)
+                item['valeur_stock'] = valeur_produit
+            else:
+                # Pour les vendeurs, valeurs masquées
+                item['valeur_masquee'] = True
+
+            data.append(item)
+
+        # Construire la réponse
+        response_data = {
+            'data': data,
+            'meta': {
+                'role': user.role,
+                'valeur_masquee': user.role != 'admin'
+            }
+        }
+
+        # Ajouter la valeur totale du stock seulement pour les admins
+        if user.role == 'admin':
+            response_data['stats'] = {
+                'valeur_stock_total': valeur_stock_total,
+                'total_produits': len(produits_ids)
+            }
+
+        return Response(response_data)
 
 
 class StockDisponibleViewSet(viewsets.ViewSet):
@@ -339,6 +402,7 @@ class StockDisponibleViewSet(viewsets.ViewSet):
 
     def list(self, request):
         produit_id = request.query_params.get('produit')
+        user = request.user
 
         if not produit_id:
             return Response({'error': 'Paramètre produit requis'}, status=400)
@@ -350,29 +414,67 @@ class StockDisponibleViewSet(viewsets.ViewSet):
 
         stocks = StockEntrepot.objects.filter(produit=produit)
 
+        # Calculer la valeur totale du stock pour ce produit (admin seulement)
+        valeur_stock_total = 0
         data = []
+
         for stock in stocks:
-            data.append({
+            # Données de base pour tous
+            item = {
                 'entrepot_id': stock.entrepot.id,
                 'entrepot_nom': stock.entrepot.nom,
-                # MODIFICATION
                 'quantite_disponible': float(stock.quantite_disponible),
-                'quantite_totale': float(stock.quantite),  # MODIFICATION
-                # MODIFICATION
+                'quantite_totale': float(stock.quantite),
                 'quantite_reservee': float(stock.quantite_reservee),
-                'stock_alerte': float(stock.stock_alerte),  # MODIFICATION
+                'stock_alerte': float(stock.stock_alerte),
                 'en_rupture': stock.en_rupture,
                 'stock_faible': stock.stock_faible
-            })
+            }
 
-        return Response({
+            # Données financières seulement pour les admins
+            if user.role == 'admin':
+                valeur_stock = float(stock.quantite) * \
+                    float(produit.prix_achat)
+                valeur_stock_total += valeur_stock
+
+                item['prix_achat'] = float(produit.prix_achat)
+                item['prix_vente'] = float(produit.prix_vente)
+                item['prix_vente_gros'] = float(produit.prix_vente_gros or 0)
+                item['prix_vente_detail'] = float(
+                    produit.prix_vente_detail or 0)
+                item['valeur_stock'] = valeur_stock
+            else:
+                item['valeur_masquee'] = True
+
+            data.append(item)
+
+        response_data = {
             'produit': {
                 'id': produit.id,
                 'nom': produit.nom,
                 'code': produit.code
             },
-            'stocks': data
-        })
+            'stocks': data,
+            'meta': {
+                'role': user.role,
+                'valeur_masquee': user.role != 'admin'
+            }
+        }
+
+        # Ajouter les infos financières du produit et la valeur totale seulement pour admin
+        if user.role == 'admin':
+            response_data['produit']['prix_achat'] = float(produit.prix_achat)
+            response_data['produit']['prix_vente'] = float(produit.prix_vente)
+            response_data['produit']['prix_vente_gros'] = float(
+                produit.prix_vente_gros or 0)
+            response_data['produit']['prix_vente_detail'] = float(
+                produit.prix_vente_detail or 0)
+            response_data['stats'] = {
+                'valeur_stock_total': valeur_stock_total,
+                'total_entrepots': len(data)
+            }
+
+        return Response(response_data)
 
 
 class StockDetailViewSet(viewsets.ViewSet):
@@ -381,6 +483,7 @@ class StockDetailViewSet(viewsets.ViewSet):
     def list(self, request):
         produit_id = request.query_params.get('produit')
         entrepot_id = request.query_params.get('entrepot')
+        user = request.user
 
         if not produit_id or not entrepot_id:
             return Response({'error': 'Paramètres produit et entrepot requis'}, status=400)
@@ -392,7 +495,37 @@ class StockDetailViewSet(viewsets.ViewSet):
             )
 
             serializer = StockDetailSerializer(stock)
-            return Response(serializer.data)
+            data = serializer.data
+
+            # Récupérer le produit pour les prix
+            produit = Produit.objects.get(id=produit_id)
+
+            # Pour les vendeurs, masquer les données financières
+            if user.role != 'admin':
+                # Supprimer les champs de prix
+                data.pop('prix_achat', None)
+                data.pop('prix_vente', None)
+                data.pop('prix_vente_gros', None)
+                data.pop('prix_vente_detail', None)
+                # Ajouter un indicateur
+                data['valeur_masquee'] = True
+            else:
+                # Pour les admins, ajouter les infos financières détaillées
+                data['prix_achat'] = float(produit.prix_achat)
+                data['prix_vente'] = float(produit.prix_vente)
+                data['prix_vente_gros'] = float(produit.prix_vente_gros or 0)
+                data['prix_vente_detail'] = float(
+                    produit.prix_vente_detail or 0)
+                data['valeur_stock'] = float(
+                    stock.quantite) * float(produit.prix_achat)
+
+                # Ajouter des métadonnées
+                data['meta'] = {
+                    'role': user.role,
+                    'valeur_masquee': False
+                }
+
+            return Response(data)
 
         except StockEntrepot.DoesNotExist:
             return Response({
