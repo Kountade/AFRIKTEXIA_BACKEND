@@ -1013,18 +1013,34 @@ class DashboardViewSet(viewsets.ViewSet):
         total_produits = Produit.objects.count()
         total_entrepots = entrepots_filter.count()
 
+        # Initialiser les variables liées au stock
         valeur_stock_total = 0
         entrepots_stocks = []
-        for entrepot in entrepots_filter:
-            valeur_stock = entrepot.stock_total_valeur()
-            valeur_stock_total += valeur_stock
-            entrepots_stocks.append({
-                'id': entrepot.id,
-                'nom': entrepot.nom,
-                'valeur_stock': valeur_stock,
-                'produits_count': entrepot.produits_count(),
-                'statut': 'actif' if entrepot.actif else 'inactif'
-            })
+
+        # NE calculer la valeur du stock que pour les administrateurs
+        if user.role == 'admin':
+            for entrepot in entrepots_filter:
+                valeur_stock = entrepot.stock_total_valeur()
+                valeur_stock_total += valeur_stock
+                entrepots_stocks.append({
+                    'id': entrepot.id,
+                    'nom': entrepot.nom,
+                    'valeur_stock': valeur_stock,
+                    'produits_count': entrepot.produits_count(),
+                    'statut': 'actif' if entrepot.actif else 'inactif',
+                    'occupation': (valeur_stock / (valeur_stock_total or 1)) * 100 if valeur_stock_total > 0 else 0
+                })
+        else:
+            # Pour les vendeurs, retourner des données sans valeur de stock
+            for entrepot in entrepots_filter:
+                entrepots_stocks.append({
+                    'id': entrepot.id,
+                    'nom': entrepot.nom,
+                    'valeur_stock': 0,  # Cacher la valeur du stock pour les vendeurs
+                    'produits_count': entrepot.produits_count(),
+                    'statut': 'actif' if entrepot.actif else 'inactif',
+                    'occupation': 0  # Cacher le pourcentage d'occupation basé sur la valeur
+                })
 
         ventes_mois = float(ventes_filter.filter(created_at__gte=month_start).aggregate(
             Sum('montant_total'))['montant_total__sum'] or 0)
@@ -1046,7 +1062,7 @@ class DashboardViewSet(viewsets.ViewSet):
                 'entrepot_id': stock.entrepot.id,
                 'entrepot_nom': stock.entrepot.nom,
                 'stock_actuel': stock.quantite_disponible,
-                'stock_alerte': float(stock.stock_alerte),  # MODIFICATION
+                'stock_alerte': float(stock.stock_alerte),
                 'statut': 'faible'
             })
 
@@ -1069,7 +1085,8 @@ class DashboardViewSet(viewsets.ViewSet):
                 'total_vendu': float(produit.total_vendu) if produit.total_vendu else 0
             })
 
-        return Response({
+        # Construire la réponse avec des données conditionnelles
+        response_data = {
             'stats': {
                 'total_ventes': total_ventes,
                 'chiffre_affaires': chiffre_affaires,
@@ -1078,13 +1095,18 @@ class DashboardViewSet(viewsets.ViewSet):
                 'total_clients': total_clients,
                 'total_produits': total_produits,
                 'total_entrepots': total_entrepots,
-                'valeur_stock_total': valeur_stock_total,
             },
             'entrepots': entrepots_stocks,
             'produits_low_stock': produits_low_stock,
             'top_produits': top_produits_data,
             'dernieres_ventes': ventes_serializer.data
-        })
+        }
+
+        # Ajouter la valeur du stock seulement pour les administrateurs
+        if user.role == 'admin':
+            response_data['stats']['valeur_stock_total'] = valeur_stock_total
+
+        return Response(response_data)
 
 
 class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
